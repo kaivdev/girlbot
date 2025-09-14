@@ -167,3 +167,4 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 
 Нужно — помогу подобрать простой workflow в n8n, накинуть SQL-миграции или расширить `/metrics` под Prometheus. Хотите оставить Docker-файлы как опцию или убрать их сейчас?
 
+# girlbot
