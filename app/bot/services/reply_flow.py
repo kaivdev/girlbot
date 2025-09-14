@@ -6,7 +6,6 @@ import asyncio
 from typing import Optional
 
 from aiogram import Bot
-from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.schemas.n8n_io import ChatInfo, Context, MessageIn, N8nRequest
@@ -14,6 +13,7 @@ from app.bot.services.anti_spam import is_allowed, remaining_wait_seconds
 from app.bot.services.history import fetch_recent_history
 from app.bot.services.metrics import metrics
 from app.bot.services.n8n_client import call_n8n
+from app.bot.services.logging import get_logger
 from app.config.settings import Settings
 from app.db.models import AssistantMessage, Chat, ChatState, Event, Message, User
 from app.utils.time import future_with_jitter, utcnow
@@ -125,10 +125,12 @@ async def process_user_text(
     req = N8nRequest(intent="reply", chat=chat_info, context=ctx, message=MessageIn(text=trimmed), trace_id=trace_id)
 
     # Call n8n
+    logger = get_logger().bind(chat_id=chat_id, user_id=user_id, intent="reply", trace_id=trace_id)
     try:
         n8n_resp = await call_n8n(req, trace_id=trace_id)
-    except Exception:
+    except Exception as e:
         # On error: notify softly and log event
+        logger.error("n8n_call_failed", exc_info=True, error=str(e))
         session.add(
             Event(kind="n8n_error", chat_id=chat_id, user_id=user_id, payload_json={"intent": "reply"})
         )
@@ -160,3 +162,4 @@ async def process_user_text(
 
     metrics.inc("replies_sent_total")
     return sent_text
+

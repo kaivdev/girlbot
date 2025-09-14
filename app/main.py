@@ -18,6 +18,7 @@ from app.config.settings import get_settings
 
 configure_logging(get_settings().log_level)
 logger = structlog.get_logger()
+logger.info("startup", n8n_webhook_url=str(get_settings().n8n_webhook_url))
 
 
 @asynccontextmanager
@@ -50,4 +51,3 @@ async def healthz() -> str:
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics_endpoint() -> str:
     return metrics.to_prometheus()
-

@@ -45,6 +45,67 @@ cp .env.example .env
 ```
 docker compose up -d
 ```
+
+### 4) nginx (бот вебхук + n8n, кратко)
+```
+sudo apt-get install -y nginx
+
+# Бот (webhook) — girlbot.<домен>
+sudo tee /etc/nginx/sites-available/girlbot.conf >/dev/null <<'NG'
+server {
+    listen 80;
+    server_name girlbot.<домен>;
+
+    # Скрытые файлы
+    location ~ /\.(?!well-known).* { return 404; }
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+}
+NG
+
+# n8n — n8n.<домен>
+sudo tee /etc/nginx/sites-available/n8n.conf >/dev/null <<'NG'
+server {
+    listen 80;
+    server_name n8n.<домен>;
+
+    location / {
+        proxy_pass http://127.0.0.1:5678;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        client_max_body_size 20m;
+        add_header X-Accel-Buffering no;
+    }
+}
+NG
+
+sudo ln -s /etc/nginx/sites-available/girlbot.conf /etc/nginx/sites-enabled/ || true
+sudo ln -s /etc/nginx/sites-available/n8n.conf /etc/nginx/sites-enabled/ || true
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+
+# TLS для обоих доменов
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d girlbot.<домен> -d n8n.<домен> --redirect
+```
 - Поднимутся: `postgres` и `bot` (порт 8080 проброшен наружу).
 - Бот внутри контейнера сам применит миграции (`alembic upgrade head`) и запустит `uvicorn` (см. `Dockerfile`).
 
@@ -91,7 +152,7 @@ docker compose exec bot python scripts/set_webhook.py
 ```
 docker run -d --name n8n \
   -p 5678:5678 \
-  -e N8N_HOST=n8n.your.domain.com \
+  -e N8N_HOST=n8n.noza.digital \
   -e N8N_PROTOCOL=https \
   -e N8N_PORT=5678 \
   -v /opt/n8n:/home/node/.n8n \
