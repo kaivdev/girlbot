@@ -1,0 +1,107 @@
+{
+  "name": "GirlBot AI Agent (OpenRouter)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-reply",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "Webhook_1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        280,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "language": "JavaScript",
+        "jsCode": "const src = (typeof $json.body === 'object' && $json.body) ? $json.body : $json;\nconst intent = src.intent ?? 'reply';\nconst lines = [];\nif (Array.isArray(src.context?.history)) {\n  for (const h of src.context.history.slice(-20)) lines.push(`${h.role}: ${h.text}`);\n}\nif (intent === 'reply' && src.message?.text) lines.push(`user: ${src.message.text}`);\nconst chatInput = lines.join('\n');\nreturn [{ json: { chatInput, intent } }];"
+      },
+      "id": "Code_BuildInput",
+      "name": "Build Chat Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "prompt": "={{$json.chatInput}}",
+        "model": "openrouter/auto",
+        "systemPrompt": "Ты дружелюбный ассистент. Отвечай кратко, по делу и на русском.",
+        "credentialsAI": {
+          "credentialType": "openAIApi",
+          "credentialId": "REPLACE_WITH_YOUR_CREDENTIAL_ID"
+        }
+      },
+      "id": "AIAgent_1",
+      "name": "AI Agent",
+      "type": "n8n-nodes-base.aiAgent",
+      "typeVersion": 1,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "language": "JavaScript",
+        "jsCode": "const text = $json.text ?? $json.output?.text ?? $json.message ?? '';\nconst model = $json.model ?? $json.output?.model ?? null;\nconst tokens = $json.usage?.total_tokens ?? $json.output?.usage?.total_tokens ?? null;\nreturn [{ json: { reply: text, meta: { model, tokens } } }];"
+      },
+      "id": "Code_MapToSchema",
+      "name": "Map To Schema",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Build Chat Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Chat Input": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Map To Schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "pinData": {}
+}
+

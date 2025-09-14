@@ -1,0 +1,29 @@
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = [
+  "E", "F", "W",      # pycodestyle / pyflakes
+  "I",                  # isort
+  "UP",                 # pyupgrade
+]
+ignore = [
+  "E501",  # line length handled by black
+]
+
+[tool.ruff.isort]
+known-first-party = ["app"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+strict_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+namespace_packages = true
+exclude = ["app/db/migrations/.*"]
+

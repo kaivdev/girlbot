@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+"""Pydantic models for n8n I/O contract."""
+
+from datetime import datetime
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
+
+
+class HistoryItem(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str
+    created_at: datetime
+
+
+class Context(BaseModel):
+    history: list[HistoryItem] = Field(default_factory=list)
+    last_user_msg_at: Optional[datetime] = None
+    last_assistant_at: Optional[datetime] = None
+
+
+class ChatInfo(BaseModel):
+    chat_id: int
+    user_id: Optional[int] = None
+    lang: Optional[str] = None
+    username: Optional[str] = None
+    persona: Optional[str] = None
+    memory_rev: Optional[int] = None
+
+
+class MessageIn(BaseModel):
+    text: Optional[str] = None
+
+
+class N8nRequest(BaseModel):
+    intent: Literal["reply", "proactive"]
+    chat: ChatInfo
+    context: Context
+    message: Optional[MessageIn] = None
+    trace_id: Optional[str] = None
+
+
+class Meta(BaseModel):
+    model: Optional[str] = None
+    tokens: Optional[int] = None
+
+    model_config = {
+        "extra": "allow",  # allow extra fields from n8n
+    }
+
+
+class N8nResponse(BaseModel):
+    reply: str
+    meta: Meta = Field(default_factory=Meta)

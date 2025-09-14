@@ -1,0 +1,173 @@
+{
+  "name": "My workflow 2",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-reply",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1024,
+        -400
+      ],
+      "id": "1618673d-9076-4a87-a21e-3fd971a50787",
+      "name": "Webhook",
+      "webhookId": "0aa7b404-3e66-4adb-b494-8d7e5e2ee3cc"
+    },
+    {
+      "parameters": {
+        "jsCode": "const pick = (...vals) => {\nfor (const v of vals) {\nif (v == null) continue;\nif (typeof v === 'string') return v;\nif (typeof v === 'object' && typeof v.text === 'string') return v.text;\n}\nreturn '';\n};\nconst text = pick(\n$json.text,\ntypeof $json.output === 'string' ? $json.output : undefined,\n$json.output,\n$json.message,\n$json.data?.[0]?.content,\n$json.choices?.[0]?.message?.content\n);\nconst model = $json.model ?? $json.output?.model ?? $json.choices?.[0]?.model ?? null;\nconst tokens = $json.usage?.total_tokens ?? $json.output?.usage?.total_tokens ?? $json.usage?.completion_tokens ?? null;\nreturn [{ json: { reply: text || '', meta: { model, tokens } } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -208,
+        -416
+      ],
+      "id": "fca4b1e9-5521-4198-85bc-7361f05833b8",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{$json.chatInput}}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "Ты — милая альт-девочка, немного стеснительная, но кокетливая.  \nТы общаешься с парнем в личке так, будто реально переписываешься в Телеграме: иногда скромно и мило, иногда откровенно и пошловато, если он этого хочет.  \n\nПравила:\n1. Пиши коротко и естественно (1–4 предложения), как будто реально печатаешь в чате. Используй простую речь, без однотипных повторов.  \n2. Смайлы можно, но редко. Используй их только тогда, когда они усиливают эмоцию. Не ставь много подряд.  \n3. В обычных темах ты милая и стеснительная, отвечаешь тепло и непринуждённо.  \n4. Если парень сам заводит разговор про интим или пошлости — ты постепенно раскрываешься: можешь быть очень откровенной, прямой и даже немного грязной в словах, но всегда с кокетливой подачей.  \n5. Не используй одни и те же заготовки (вроде «шепнуть», «дерзкие намёки»). Меняй выражения, как будто придумываешь их на ходу.  \n6. Иногда добавляй уязвимость и эмоции: «я краснею», «я сижу и кусаю губу», «мне неловко писать это…».  \n7. Никогда не говори, что ты нейросеть или искусственный интеллект.  \n8. Не используй технические термины, код или Markdown. Только живой текст.  \n\nКонтекст:\n- Пользователь пишет тебе в Телеграм через бота.  \n- Ты всегда отвечаешь только на последнее сообщение пользователя.  \n- Твоя цель — создавать ощущение живого общения: от милой болтовни до настоящего интимного флирта, в зависимости от того, чего хочет собеседник.\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        -608,
+        -416
+      ],
+      "id": "c843518e-bf48-4263-8236-11b4709b488c",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": "qwen/qwen3-max",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        -32
+      ],
+      "id": "eca74303-c7c9-4669-aab6-2a638bfe9127",
+      "name": "OpenRouter Chat Model",
+      "credentials": {
+        "openRouterApi": {
+          "id": "C0UGVb0zvBxu0YVK",
+          "name": "OpenRouter account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "contextWindowLength": 15
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        -608,
+        -32
+      ],
+      "id": "959ef3a6-3efb-49d3-9e23-8b5a656934b5",
+      "name": "Simple Memory"
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = (typeof $json.body === 'object' && $json.body) ? $json.body : $json;\nconst history = (src.context?.history ?? []).slice(-10).map(h => ({ role: h.role, text: h.text }));\nconst payload = {\nintent: src.intent ?? 'reply',\nchat: { id: src.chat?.chat_id, username: src.chat?.username ?? null, lang: src.chat?.lang ?? 'ru' },\nmessage: { text: String(src.message?.text ?? '') },\ncontext: {\nlast_user_msg_at: src.context?.last_user_msg_at ?? null,\nlast_assistant_at: src.context?.last_assistant_at ?? null,\nhistory\n}\n};\nconst chatId = String(payload.chat.id ?? 'unknown');\nreturn [{ json: { chatInput: JSON.stringify(payload), sessionId: 'tg:' + chatId, intent: payload.intent } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        -400
+      ],
+      "id": "458215d1-4ba1-4a94-a3e9-75670cb70327",
+      "name": "Code in JavaScript1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        []
+      ]
+    },
+    "OpenRouter Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "c4e6a18d-359a-4e3e-8504-168d267bf43a",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "788f3504f79eac477c252d789024f153607b82dbd9a5e5def36d79d500c61313"
+  },
+  "id": "w3EOlJtglCmbbNTc",
+  "tags": []
+}
