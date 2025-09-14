@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Telegram Bot with FastAPI + aiogram 3 + Postgres
 
 Проект — Telegram-бот на aiogram v3 с FastAPI webhook, Postgres (SQLAlchemy Async + Alembic), без Redis. Логи — структурные (structlog), простые метрики в формате Prometheus.
@@ -168,3 +169,6 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 Нужно — помогу подобрать простой workflow в n8n, накинуть SQL-миграции или расширить `/metrics` под Prometheus. Хотите оставить Docker-файлы как опцию или убрать их сейчас?
 
 # girlbot
+=======
+# girlbot
+>>>>>>> 30b9948f7e3595345b38f14a4d4c6452f09ccbcd
