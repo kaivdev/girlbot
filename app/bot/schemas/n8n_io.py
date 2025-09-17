@@ -34,7 +34,15 @@ class MessageIn(BaseModel):
 
 
 class N8nRequest(BaseModel):
-    intent: Literal["reply", "proactive"]
+    intent: Literal[
+        "reply",
+        "proactive_morning",
+        "proactive_evening",
+        "proactive_reengage",
+        "proactive_generic",
+        "user_goodnight",
+        "goodnight_followup",
+    ]
     chat: ChatInfo
     context: Context
     message: Optional[MessageIn] = None

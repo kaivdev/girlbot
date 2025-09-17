@@ -1,18 +1,19 @@
-## Деплой Telegram‑бота (FastAPI + aiogram v3) на сервер
+## Развёртывание Telegram-бота (FastAPI + aiogram v3)
 
-Ниже два варианта: через Docker Compose (проще) и без Docker (через venv + systemd). В обоих случаях нужен публичный HTTPS‑адрес для Telegram webhook.
+Инструкция для двух вариантов: через Docker Compose (рекомендуется) и без Docker (venv + systemd). В обоих случаях потребуется настроить HTTPS (nginx) для Telegram webhook.
 
 ### Предпосылки
 - Сервер: Ubuntu 22.04/24.04 (root или sudo)
-- Домен/поддомен для бота, A‑запись на сервер
-- Открыт 80/443 (TLS) и, если нужно, 8080 локально
+- DNS: A-записи на сервер для доменов `girlbot.<домен>` и `n8n.<домен>`
+- Порты 80/443 (TLS) открыты; локально бот слушает 8080
 
-Переменные окружения (.env): см. `.env.example`. Обязательно заполнить:
+Обязательные переменные окружения (.env), см. `.env.example`:
 - `TELEGRAM_BOT_TOKEN`
 - `WEBHOOK_SECRET`
-- `PUBLIC_BASE_URL` (публичный HTTPS URL, куда укажем вебхук)
-- `N8N_WEBHOOK_URL` (адрес workflow в n8n)
-- `DB_DSN` (DSN к Postgres — формат зависит от способа деплоя)
+- `PUBLIC_BASE_URL` (публичный HTTPS URL бота, напр. `https://girlbot.noza.digital`)
+- `N8N_WEBHOOK_URL` (Production URL workflow в n8n, напр. `https://n8n.noza.digital/webhook/ai-reply`)
+- `DB_DSN` (DSN Postgres)
+- Опционально: `OPENROUTER_REFERRER` — только ASCII-домен/URL (или пусто)
 
 ---
 
@@ -31,22 +32,24 @@ sudo usermod -aG docker $USER
 newgrp docker
 ```
 
-### 2) Клонирование и настройка
+### 2) Клонирование и подготовка
 ```
 cd /opt
-sudo git clone <ваш-репозиторий> girlbot
+sudo git clone <URL-репозитория> girlbot
 sudo chown -R $USER:$USER girlbot
 cd girlbot
 cp .env.example .env
 ```
-- Заполните `.env` (для Compose `DB_DSN` внутри контейнера уже переопределяется на `postgresql+asyncpg://user:pass@db:5432/tgbot`).
+- Заполните `.env`. Для Compose `DB_DSN` должен ссылаться на сервис `db`:
+  - `DB_DSN=postgresql+asyncpg://user:pass@db:5432/tgbot`
 
 ### 3) Запуск
 ```
-docker compose up -d
+docker compose up -d --build
 ```
+- Логи: `docker compose logs -f bot`
 
-### 4) nginx (бот вебхук + n8n, кратко)
+### 4) nginx (reverse proxy + TLS)
 ```
 sudo apt-get install -y nginx
 
@@ -56,7 +59,7 @@ server {
     listen 80;
     server_name girlbot.<домен>;
 
-    # Скрытые файлы
+    # Защита статических точек
     location ~ /\.(?!well-known).* { return 404; }
 
     location / {
@@ -102,69 +105,39 @@ sudo ln -s /etc/nginx/sites-available/n8n.conf /etc/nginx/sites-enabled/ || true
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl reload nginx
 
-# TLS для обоих доменов
+# TLS (Let's Encrypt)
 sudo apt-get install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d girlbot.<домен> -d n8n.<домен> --redirect
 ```
-- Поднимутся: `postgres` и `bot` (порт 8080 проброшен наружу).
-- Бот внутри контейнера сам применит миграции (`alembic upgrade head`) и запустит `uvicorn` (см. `Dockerfile`).
 
-### 4) Reverse‑proxy + TLS (nginx)
-```
-sudo apt-get install -y nginx
-sudo tee /etc/nginx/sites-available/girlbot.conf >/dev/null <<'NG'
-server {
-    listen 80;
-    server_name your.domain.com;
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-NG
-sudo ln -s /etc/nginx/sites-available/girlbot.conf /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-```
-- Выдайте TLS (Let’s Encrypt):
-```
-sudo apt-get install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d your.domain.com
-```
+Примечания:
+- Контейнеры `postgres` и `bot` поднимутся автоматически (бот миграции делает при старте).
+- Если увидите предупреждение `the attribute version is obsolete` — можно удалить строку `version:` из `docker-compose.yml`.
 
 ### 5) Установка Telegram Webhook
-- В корне репозитория:
-```
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt  # нужен httpx и python-dotenv для скрипта
-python scripts/set_webhook.py
-```
-- Либо из контейнера:
+- В Docker:
 ```
 docker compose exec bot python scripts/set_webhook.py
 ```
 - Проверка: `https://api.telegram.org/bot<ТОКЕН>/getWebhookInfo`
 
-### 6) n8n на сервере (опционально)
-Простой запуск в Docker:
+### 6) Запуск n8n (если отдельно в Docker)
 ```
 docker run -d --name n8n \
-  -p 5678:5678 \
-  -e N8N_HOST=n8n.noza.digital \
+  --restart unless-stopped \
+  -p 127.0.0.1:5678:5678 \
+  -e N8N_HOST=n8n.<домен> \
   -e N8N_PROTOCOL=https \
-  -e N8N_PORT=5678 \
+  -e N8N_PORT=443 \
+  -e WEBHOOK_URL=https://n8n.<домен>/ \
   -v /opt/n8n:/home/node/.n8n \
   n8nio/n8n:latest
 ```
-- Зайдите в UI (`/` на 5678), импортируйте `n8n_workflow_ai_agent.json` из корня проекта.
-- В ноде `AI Agent` укажите креды `OpenAI API` с `Base URL=https://openrouter.ai/api/v1` и API‑ключ.
-- Убедитесь, что Production URL workflow совпадает с `N8N_WEBHOOK_URL` в `.env`.
+- После запуска импортируйте workflow и активируйте его (Active). В `.env` у бота установите `N8N_WEBHOOK_URL` равным Production URL (`/webhook/...`).
 
 ---
 
-## Вариант B — Без Docker (venv + systemd)
+## Вариант B — без Docker (venv + systemd)
 
 ### 1) Установка зависимостей
 ```
@@ -172,33 +145,33 @@ sudo apt-get update
 sudo apt-get install -y python3.11-venv python3-pip postgresql postgresql-contrib nginx
 ```
 
-### 2) Создание БД/пользователя
+### 2) Настройка БД
 ```
 sudo -u postgres psql <<'SQL'
-CREATE USER girlbot WITH PASSWORD 'СЛОЖНЫЙ_ПАРОЛЬ';
+CREATE USER girlbot WITH PASSWORD '<пароль>';
 CREATE DATABASE tgbot OWNER girlbot;
 GRANT ALL PRIVILEGES ON DATABASE tgbot TO girlbot;
 SQL
 ```
 
-### 3) Развёртывание кода
+### 3) Развёртывание приложения
 ```
 sudo mkdir -p /opt/girlbot && sudo chown -R $USER:$USER /opt/girlbot
 cd /opt/girlbot
-git clone <ваш-репозиторий> .
+git clone <URL-репозитория> .
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
-- В `.env` укажите локальный DSN: `DB_DSN=postgresql+asyncpg://girlbot:ПАРОЛЬ@127.0.0.1:5432/tgbot`
+- В `.env` укажите DSN локальной БД: `DB_DSN=postgresql+asyncpg://girlbot:<пароль>@127.0.0.1:5432/tgbot`
 
-### 4) Применение миграций
+### 4) Миграции
 ```
 alembic upgrade head
 ```
 
-### 5) systemd‑юнит для uvicorn
+### 5) systemd unit для uvicorn
 ```
 sudo tee /etc/systemd/system/girlbot.service >/dev/null <<'UNIT'
 [Unit]
@@ -222,7 +195,7 @@ sudo systemctl status girlbot.service
 ```
 
 ### 6) nginx + TLS
-- Конфигурация аналогична варианту с Docker (см. выше шаг 4).
+- Аналогично разделу выше (Docker/nginx).
 
 ### 7) Установка Telegram Webhook
 ```
@@ -230,72 +203,31 @@ source /opt/girlbot/.venv/bin/activate
 python scripts/set_webhook.py
 ```
 
-### 8) n8n (без Docker)
+### 8) n8n без Docker
 ```
 npm i -g n8n
 n8n start --port 5678
 ```
-- Или используйте Docker‑команду из варианта A. В `.env` обновите `N8N_WEBHOOK_URL`.
+- Настройте nginx и `N8N_WEBHOOK_URL` как в варианте A.
 
 ---
 
-## Обновления и миграции
-- Обновить код (в корне):
+## Проверки и обновления
+- Проверка здоровья: `curl -sSf https://girlbot.<домен>/healthz` → `ok`
+- Метрики: `https://girlbot.<домен>/metrics`
+- Переустановка вебхука: `docker compose exec bot python scripts/set_webhook.py`
+- Обновление версии:
 ```
 git pull
-source .venv/bin/activate  # если без Docker
-pip install -r requirements.txt
-alembic upgrade head
-sudo systemctl restart girlbot.service   # без Docker
+docker compose up -d --build   # для Docker
 # или
-docker compose up -d --build            # с Docker
+source .venv/bin/activate && pip install -r requirements.txt && alembic upgrade head && sudo systemctl restart girlbot.service
 ```
 
-## Резервные копии БД
-```
-# Бэкап
-pg_dump --dbname=postgresql://girlbot:ПАРОЛЬ@127.0.0.1:5432/tgbot -Fc -f /opt/backup/tgbot_$(date +%F).dump
-# Восстановление
-pg_restore -d postgresql://girlbot:ПАРОЛЬ@127.0.0.1:5432/tgbot /opt/backup/tgbot_YYYY-MM-DD.dump
-```
-
-## Проверка и диагностика
-- Healthcheck: `curl https://your.domain.com/healthz` → `ok`
-- Метрики: `curl https://your.domain.com/metrics`
-- Webhook: `https://api.telegram.org/bot<ТОКЕН>/getWebhookInfo`
-- Логи (без Docker):
-```
-sudo journalctl -u girlbot.service -f
-```
-- Логи (Docker):
-```
-docker compose logs -f bot db
-```
-- Статус миграций:
-```
-alembic current
-alembic history -v
-```
-
-## Частые проблемы
-- `Bad Request: chat not found` — бот пытается писать в чат, где пользователь ещё не нажал `/start`, или бот удалён из чата. Решение: написать боту `/start` ещё раз, либо очистить `chat_state`.
-- Долгая задержка — проверь `/metrics` (`n8n_request_seconds_*`). Ускорить: уменьшить `REPLY_DELAY_*` в `.env`, выбрать более быструю модель в n8n, снизить `max_tokens`.
-- Проактив «не приходит» — проверь `chat_state.next_proactive_at` vs `now() AT TIME ZONE 'UTC'`. Форс: `UPDATE chat_state SET next_proactive_at = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - INTERVAL '1 second' WHERE chat_id=<ID>;`
-- Вебхук не срабатывает — заново выставить скриптом `scripts/set_webhook.py`, проверить, что `PUBLIC_BASE_URL` с валидным HTTPS.
-
-## Безопасность
-- Не публикуйте `TELEGRAM_BOT_TOKEN` и API‑ключи.
-- Ограничьте доступ к `/metrics` (nginx allow/deny) или держите только во внутренней сети.
-- Храните `.env` с правами 600, используйте секреты в CI/CD.
-
----
-
-## Быстрый чек‑лист деплоя (Docker)
-1. Установить Docker/Compose
-2. Клонировать репозиторий, заполнить `.env`
-3. `docker compose up -d`
-4. Настроить nginx + TLS (proxy → 8080)
-5. `python scripts/set_webhook.py`
-6. Импортировать `n8n_workflow_ai_agent.json` в n8n и указать креды
-7. Проверить `/healthz`, `/metrics`, бота в Telegram
+## Траблшутинг
+- 502 Bad Gateway в getWebhookInfo — историческая ошибка nginx, если бот был недоступен. Если сейчас `pending_update_count=0` и всё работает, можно игнорировать или переустановить вебхук.
+- 404 на `/webhook/...` n8n — workflow не активирован или неверный метод. Проверять нужно POST; включите “Active”.
+- 500 `No item to return was found` — последний узел в n8n вернул 0 items. Добавьте fallback: `return [{ json: { reply: "Сервис занят, попробуйте позже", meta: {} } }];` и/или “Continue On Fail”.
+- Бот пишет “Сервис занят, попробуйте позже” — ошибка запроса к n8n. Проверьте `N8N_WEBHOOK_URL` и логи. Значение `OPENROUTER_REFERRER` должно быть ASCII‑URL или пустым.
+- n8n медленно отвечает — по умолчанию таймаут клиента 60с. При необходимости увеличьте (сделаем настраиваемым по запросу).
 

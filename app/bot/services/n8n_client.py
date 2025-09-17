@@ -7,11 +7,20 @@ from time import perf_counter
 from typing import AsyncIterator
 
 import httpx
+from urllib.parse import urlparse
 
 from app.bot.schemas.n8n_io import N8nRequest, N8nResponse
 from app.bot.services.metrics import metrics
 from app.config.settings import get_settings
 from app.bot.services.logging import get_logger
+
+
+def _is_ascii(value: str) -> bool:
+    try:
+        value.encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
 
 
 @asynccontextmanager
@@ -30,9 +39,22 @@ async def call_n8n(req: N8nRequest, *, trace_id: str | None = None) -> N8nRespon
     settings = get_settings()
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if trace_id:
-        headers["X-Trace-Id"] = trace_id
+        # ensure header value is ASCII-safe
+        if _is_ascii(trace_id):
+            headers["X-Trace-Id"] = trace_id
+        else:
+            get_logger().warning("skip_trace_id_non_ascii")
     if settings.openrouter_referrer:
-        headers["Referer"] = settings.openrouter_referrer
+        ref = settings.openrouter_referrer.strip()
+        if _is_ascii(ref):
+            # allow domain or full URL; normalize to URL
+            parsed = urlparse(ref if ref.startswith("http") else f"https://{ref}")
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                headers["Referer"] = parsed.geturl()
+            else:
+                get_logger().warning("skip_referer_invalid", value=ref)
+        else:
+            get_logger().warning("skip_referer_non_ascii", value_preview=ref[:32])
 
     payload = req.model_dump(mode="json")
     start = perf_counter()

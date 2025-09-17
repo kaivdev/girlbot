@@ -143,3 +143,15 @@ async def cmd_reset(message: Message) -> None:
         state.memory_rev = (state.memory_rev or 1) + 1
 
     await message.answer("Контекст очищен: история сброшена, память перезапущена. Можешь продолжать.")
+
+
+@commands_router.message(Command("wake"))
+async def cmd_wake(message: Message) -> None:
+    chat_id = message.chat.id
+    async with session_scope() as session:
+        state = await session.get(ChatState, chat_id)
+        if state is None:
+            state = ChatState(chat_id=chat_id)
+            session.add(state)
+        state.sleep_until = None
+    await message.answer("Я проснулась, можем продолжать ☀️")

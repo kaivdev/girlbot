@@ -26,6 +26,14 @@ class ProactiveSettings(BaseModel):
 class ReplyDelaySettings(BaseModel):
     min_seconds: int = 5
     max_seconds: int = 10
+    # Редкая длинная задержка: вероятность (0..1) и диапазон секунд
+    rare_long_probability: float = 0.0
+    rare_long_min_seconds: int = 180
+    rare_long_max_seconds: int = 360
+    # Первый ответ после долгой паузы (детерминированно)
+    inactivity_long_threshold_minutes: int = 120
+    inactivity_long_min_seconds: int = 180
+    inactivity_long_max_seconds: int = 300
 
 
 class AntiSpamSettings(BaseModel):
@@ -66,6 +74,13 @@ class Settings(BaseSettings):
     reply_delay: ReplyDelaySettings = ReplyDelaySettings()
     antispam: AntiSpamSettings = AntiSpamSettings()
 
+    # Proactive extended windows (HH:MM-HH:MM). Quiet hours, morning, evening
+    proactive_morning_window: str | None = None  # e.g. "07:00-09:30"
+    proactive_evening_window: str | None = None  # e.g. "22:30-00:30"
+    proactive_quiet_window: str | None = None    # e.g. "00:30-07:00"
+    reengage_min_hours: int = 6
+    reengage_cooldown_hours: int = 12
+
     # Limits
     max_user_text_len: int = 4000
 
@@ -96,10 +111,34 @@ class Settings(BaseSettings):
 
         self.reply_delay.min_seconds = _get_int("REPLY_DELAY_MIN_SECONDS", self.reply_delay.min_seconds)
         self.reply_delay.max_seconds = _get_int("REPLY_DELAY_MAX_SECONDS", self.reply_delay.max_seconds)
+        # Дополнительно читаем редкую длинную задержку (если заданы)
+        try:
+            rl_prob = os.getenv("REPLY_RARE_LONG_PROB")
+            if rl_prob is not None:
+                self.reply_delay.rare_long_probability = float(rl_prob)
+            self.reply_delay.rare_long_min_seconds = _get_int(
+                "REPLY_RARE_LONG_MIN_SECONDS", self.reply_delay.rare_long_min_seconds
+            )
+            self.reply_delay.rare_long_max_seconds = _get_int(
+                "REPLY_RARE_LONG_MAX_SECONDS", self.reply_delay.rare_long_max_seconds
+            )
+            # Long inactivity deterministic delay
+            self.reply_delay.inactivity_long_threshold_minutes = _get_int(
+                "REPLY_INACTIVITY_LONG_THRESHOLD_MINUTES", self.reply_delay.inactivity_long_threshold_minutes
+            )
+            self.reply_delay.inactivity_long_min_seconds = _get_int(
+                "REPLY_INACTIVITY_LONG_MIN_SECONDS", self.reply_delay.inactivity_long_min_seconds
+            )
+            self.reply_delay.inactivity_long_max_seconds = _get_int(
+                "REPLY_INACTIVITY_LONG_MAX_SECONDS", self.reply_delay.inactivity_long_max_seconds
+            )
+        except Exception:
+            pass
 
         self.antispam.user_min_seconds_between_msg = _get_int(
             "USER_MIN_SECONDS_BETWEEN_MSG", self.antispam.user_min_seconds_between_msg
         )
+        # Nothing else: окна читаем как строки, числа уже есть
 
 
 @lru_cache(maxsize=1)
