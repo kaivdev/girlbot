@@ -22,6 +22,7 @@ from typing import Optional, Dict, List
 import time
 
 from dotenv import load_dotenv
+from sqlalchemy import delete
 from pyrogram import Client, filters
 from pyrogram.enums import ChatAction, ChatType
 from pyrogram.types import Message
@@ -29,7 +30,7 @@ from pyrogram.types import Message
 from app.config.settings import get_settings
 from app.db.base import session_scope
 from app.bot.services.reply_flow import process_user_text
-from app.db.models import ProactiveOutbox, AssistantMessage, ChatState
+from app.db.models import ProactiveOutbox, AssistantMessage, ChatState, Message as DBMessage
 from app.utils.time import utcnow
 
 
@@ -234,33 +235,40 @@ async def main() -> None:
         if typing_enabled:
             typing_task = asyncio.create_task(typing_loop(app, chat.id, typing_interval))
         try:
+            cancelled = False
             async with session_scope() as session:
-                await process_user_text(
-                    shim,
-                    session,
-                    chat_id=chat.id,
-                    chat_type=_chat_type_str(chat.type),
-                    user_id=(user.id if user else None),
-                    username=(user.username if user else None),
-                    lang=(getattr(user, "language_code", None) if user else None),
-                    text=text,
-                    settings=settings,
-                    trace_id=None,
-                )
+                try:
+                    await process_user_text(
+                        shim,
+                        session,
+                        chat_id=chat.id,
+                        chat_type=_chat_type_str(chat.type),
+                        user_id=(user.id if user else None),
+                        username=(user.username if user else None),
+                        lang=(getattr(user, "language_code", None) if user else None),
+                        text=text,
+                        settings=settings,
+                        trace_id=None,
+                    )
+                except asyncio.CancelledError:
+                    cancelled = True
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+                # exit context manager normally to ensure proper cleanup
             # Как только реальный ответ отправлен (функция вернулась) — убираем индикацию набора,
             # чтобы не возникал повторный "всплеск" typing через пару секунд.
             if typing_task:
                 typing_task.cancel()
                 with contextlib.suppress(Exception):
                     await typing_task
-            if typing_enabled and min_typing_seconds > 0:
+            if not cancelled and typing_enabled and min_typing_seconds > 0:
                 # Додерживаем минимальное время ТОЛЬКО если ответ пришёл слишком быстро,
                 # но уже без новых send_chat_action (индикатор просто погаснет чуть раньше — это ок).
                 elapsed = time.monotonic() - start_t
                 remaining = min_typing_seconds - elapsed
                 if remaining > 0:
                     await asyncio.sleep(remaining)
-            if mark_read_mode in {"after_reply", "delay"}:
+            if not cancelled and mark_read_mode in {"after_reply", "delay"}:
                 if mark_read_mode == "delay" and delay_mark_read_sec > 0:
                     await asyncio.sleep(delay_mark_read_sec)
                 if not read_done:
@@ -279,6 +287,46 @@ async def main() -> None:
                     read_task.cancel()
                     with contextlib.suppress(Exception):
                         await read_task
+        # Если задача была отменена — корректно выходим без ответа
+        if locals().get("cancelled"):
+            return
+
+    @app.on_message(filters.command(["reset"]) & ~filters.me)
+    async def handle_reset(_: Client, message: Message):
+        # Ограничим обработку командами, адресованными нам (для групп — при упоминании/ответе)
+        if not my_id_box:
+            me = await app.get_me()
+            my_id_box["id"] = me.id
+        if not _is_for_me(message, my_id_box["id"]):
+            return
+        chat_id = message.chat.id
+        # Остановим буферы/генерацию для чата
+        if task := buffer_tasks.get(chat_id):
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await task
+            buffer_tasks.pop(chat_id, None)
+        if task := inflight_tasks.get(chat_id):
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await task
+            inflight_tasks.pop(chat_id, None)
+        message_buffers[chat_id] = []
+
+        # Очистим историю чата и сбросим память
+        async with session_scope() as session:
+            await session.execute(delete(DBMessage).where(DBMessage.chat_id == chat_id))
+            await session.execute(delete(AssistantMessage).where(AssistantMessage.chat_id == chat_id))
+            state = await session.get(ChatState, chat_id)
+            if state is None:
+                state = ChatState(chat_id=chat_id)
+                session.add(state)
+            state.last_user_msg_at = None
+            state.last_assistant_at = None
+            state.next_proactive_at = None
+            state.memory_rev = (state.memory_rev or 1) + 1
+
+        await app.send_message(chat_id, "Контекст очищен: история сброшена, память перезапущена. Можешь продолжать.")
 
     @app.on_message(filters.text & ~filters.me)
     async def handle_text(_: Client, message: Message):
