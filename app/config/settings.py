@@ -13,6 +13,21 @@ from pydantic import AnyHttpUrl, BaseModel, PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _get_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _get_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 class LoggingSettings(BaseModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
@@ -95,49 +110,39 @@ class Settings(BaseSettings):
     def model_post_init(self, __context: dict[str, object]) -> None:  # type: ignore[override]
         """Map flat env vars into nested settings for convenience."""
 
-        def _get_bool(name: str, default: bool) -> bool:
-            raw = os.getenv(name)
-            if raw is None:
-                return default
-            return raw.lower() in {"1", "true", "yes", "y", "on"}
+        self.proactive.default_auto_messages = _get_bool_env("AUTO_MESSAGES_DEFAULT", self.proactive.default_auto_messages)
+        self.proactive.min_seconds = _get_int_env("PROACTIVE_MIN_SECONDS", self.proactive.min_seconds)
+        self.proactive.max_seconds = _get_int_env("PROACTIVE_MAX_SECONDS", self.proactive.max_seconds)
+        # Optional: disable generic proactive via env
+        self.proactive.generic_enabled = _get_bool_env("PROACTIVE_GENERIC_ENABLED", self.proactive.generic_enabled)
 
-        def _get_int(name: str, default: int) -> int:
-            raw = os.getenv(name)
-            return int(raw) if raw is not None else default
-
-        self.proactive.default_auto_messages = _get_bool("AUTO_MESSAGES_DEFAULT", self.proactive.default_auto_messages)
-        self.proactive.min_seconds = _get_int("PROACTIVE_MIN_SECONDS", self.proactive.min_seconds)
-        self.proactive.max_seconds = _get_int("PROACTIVE_MAX_SECONDS", self.proactive.max_seconds)
-    # Optional: disable generic proactive via env
-    self.proactive.generic_enabled = _get_bool("PROACTIVE_GENERIC_ENABLED", self.proactive.generic_enabled)
-
-        self.reply_delay.min_seconds = _get_int("REPLY_DELAY_MIN_SECONDS", self.reply_delay.min_seconds)
-        self.reply_delay.max_seconds = _get_int("REPLY_DELAY_MAX_SECONDS", self.reply_delay.max_seconds)
+        self.reply_delay.min_seconds = _get_int_env("REPLY_DELAY_MIN_SECONDS", self.reply_delay.min_seconds)
+        self.reply_delay.max_seconds = _get_int_env("REPLY_DELAY_MAX_SECONDS", self.reply_delay.max_seconds)
         # Дополнительно читаем редкую длинную задержку (если заданы)
         try:
             rl_prob = os.getenv("REPLY_RARE_LONG_PROB")
             if rl_prob is not None:
                 self.reply_delay.rare_long_probability = float(rl_prob)
-            self.reply_delay.rare_long_min_seconds = _get_int(
+            self.reply_delay.rare_long_min_seconds = _get_int_env(
                 "REPLY_RARE_LONG_MIN_SECONDS", self.reply_delay.rare_long_min_seconds
             )
-            self.reply_delay.rare_long_max_seconds = _get_int(
+            self.reply_delay.rare_long_max_seconds = _get_int_env(
                 "REPLY_RARE_LONG_MAX_SECONDS", self.reply_delay.rare_long_max_seconds
             )
             # Long inactivity deterministic delay
-            self.reply_delay.inactivity_long_threshold_minutes = _get_int(
+            self.reply_delay.inactivity_long_threshold_minutes = _get_int_env(
                 "REPLY_INACTIVITY_LONG_THRESHOLD_MINUTES", self.reply_delay.inactivity_long_threshold_minutes
             )
-            self.reply_delay.inactivity_long_min_seconds = _get_int(
+            self.reply_delay.inactivity_long_min_seconds = _get_int_env(
                 "REPLY_INACTIVITY_LONG_MIN_SECONDS", self.reply_delay.inactivity_long_min_seconds
             )
-            self.reply_delay.inactivity_long_max_seconds = _get_int(
+            self.reply_delay.inactivity_long_max_seconds = _get_int_env(
                 "REPLY_INACTIVITY_LONG_MAX_SECONDS", self.reply_delay.inactivity_long_max_seconds
             )
         except Exception:
             pass
 
-        self.antispam.user_min_seconds_between_msg = _get_int(
+        self.antispam.user_min_seconds_between_msg = _get_int_env(
             "USER_MIN_SECONDS_BETWEEN_MSG", self.antispam.user_min_seconds_between_msg
         )
         # Nothing else: окна читаем как строки, числа уже есть
