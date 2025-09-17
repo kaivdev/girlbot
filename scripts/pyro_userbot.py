@@ -20,6 +20,7 @@ import random
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, List
 import time
+from collections import deque
 
 from dotenv import load_dotenv
 from sqlalchemy import delete
@@ -37,10 +38,19 @@ from app.utils.time import utcnow
 class PyroBotShim:
     """Minimal shim to satisfy process_user_text(bot=...)."""
 
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, reply_selector: Optional[callable] = None):
         self.client = client
+        self.reply_selector = reply_selector
 
     async def send_message(self, chat_id: int, text: str):  # aiogram-like surface
+        reply_to_id = None
+        if self.reply_selector:
+            try:
+                reply_to_id = self.reply_selector(chat_id)
+            except Exception:
+                reply_to_id = None
+        if reply_to_id:
+            return await self.client.send_message(chat_id, text, reply_to_message_id=reply_to_id)
         return await self.client.send_message(chat_id, text)
 
 
@@ -96,7 +106,49 @@ async def main() -> None:
         # Will create a local session file named `userbot.session` and ask for login
         app = Client(name="userbot", api_id=api_id, api_hash=api_hash)
 
-    shim = PyroBotShim(app)
+    # Periodic reply-to configuration
+    reply_quote_enabled = os.getenv("USERBOT_REPLY_QUOTE_ENABLED", "1").lower() in {"1","true","yes","on"}
+    reply_quote_every_min = int(float(os.getenv("USERBOT_REPLY_QUOTE_EVERY_MIN", "10")))
+    reply_quote_every_max = int(float(os.getenv("USERBOT_REPLY_QUOTE_EVERY_MAX", "15")))
+    if reply_quote_every_max < reply_quote_every_min:
+        reply_quote_every_max = reply_quote_every_min
+
+    # Per-chat counters and thresholds
+    reply_counters: Dict[int, int] = {}
+    reply_thresholds: Dict[int, int] = {}
+    recent_user_msgs: Dict[int, deque[int]] = {}
+
+    def _new_threshold() -> int:
+        return random.randint(reply_quote_every_min, reply_quote_every_max)
+
+    def _select_reply_to(chat_id: int) -> Optional[int]:
+        if not reply_quote_enabled:
+            return None
+        # init structures
+        cnt = reply_counters.get(chat_id, 0) + 1
+        reply_counters[chat_id] = cnt
+        thr = reply_thresholds.get(chat_id)
+        if thr is None or thr <= 0:
+            thr = _new_threshold()
+            reply_thresholds[chat_id] = thr
+        if cnt >= thr:
+            # reset for next cycle
+            reply_counters[chat_id] = 0
+            reply_thresholds[chat_id] = _new_threshold()
+            dq = recent_user_msgs.get(chat_id)
+            if dq and len(dq) > 0:
+                # pick a random recent message id to reply to
+                try:
+                    idx = random.randrange(0, len(dq))
+                    return list(dq)[idx]
+                except Exception:
+                    try:
+                        return dq[-1]
+                    except Exception:
+                        return None
+        return None
+
+    shim = PyroBotShim(app, reply_selector=_select_reply_to)
 
     # Userbot behavior configuration (env overrides)
     # Поведение прочтения:
@@ -338,6 +390,10 @@ async def main() -> None:
             return
         if message.from_user and getattr(message.from_user, "is_bot", False):
             return
+
+        # Запоминаем id входящих юзерских сообщений для потенциального reply_to
+        dq = recent_user_msgs.setdefault(message.chat.id, deque(maxlen=20))
+        dq.append(message.id)
 
         if not batch_enabled:
             await _process_single(app, shim, message, message.text or "")
