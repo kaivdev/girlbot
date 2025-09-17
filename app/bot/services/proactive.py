@@ -7,7 +7,7 @@ from typing import Callable, Optional, AsyncContextManager, Tuple
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.schemas.n8n_io import ChatInfo, Context, N8nRequest
@@ -63,6 +63,10 @@ def compute_next_proactive_at(now: datetime, settings: Settings) -> datetime:
 
 
 logger = get_logger()
+
+
+MORNING_SPAM_WINDOW_MINUTES = 30
+MORNING_SPAM_MAX = 1  # допустимо столько morning внутри окна
 
 
 async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings) -> None:
@@ -136,6 +140,15 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
         if not intent:
             continue
 
+        # Advisory lock per chat внутри общей транзакции, чтобы параллельные процессы не дублировали
+        try:
+            lock_res = await session.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": state.chat_id})
+            if not lock_res.scalar():  # уже обрабатывается другим инстансом
+                continue
+        except Exception:
+            # если БД не PG или нет привилегий — просто продолжаем без локов
+            pass
+
         chat_id = state.chat_id
 
         if history_trim:
@@ -158,14 +171,25 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
 
         meta = resp.meta.model_dump()
         meta = {"intent": intent, **meta}
-        if getattr(state, "proactive_via_userbot", False):
-            # enqueue in outbox; userbot воркер отправит
-            session.add(ProactiveOutbox(chat_id=chat_id, intent=intent, text=resp.reply, meta_json=meta))
-        else:
-            await bot.send_message(chat_id, resp.reply)
-            session.add(AssistantMessage(chat_id=chat_id, text=resp.reply, meta_json=meta))
-            state.last_assistant_at = utcnow()
+        # Антиспам для morning: если уже есть отправка за окно, отключаем auto
+        if intent == "proactive_morning":
+            recent_cnt_q = select(func.count(AssistantMessage.id)).where(
+                AssistantMessage.chat_id == chat_id,
+                AssistantMessage.created_at > now_utc - timedelta(minutes=MORNING_SPAM_WINDOW_MINUTES),
+            )
+            recent_cnt = (await session.execute(recent_cnt_q)).scalar() or 0
+            if recent_cnt >= MORNING_SPAM_MAX:
+                state.auto_enabled = False
+                logger.warning(
+                    "proactive_morning_spam_disabled", chat_id=chat_id, recent_cnt=recent_cnt
+                )
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                continue
 
+        # Ставим отметку СРАЗУ (раньше отправки), чтобы при падении после send не зациклиться
         if intent == "proactive_morning":
             state.last_morning_sent_at = now_utc
         elif intent == "proactive_evening":
@@ -173,17 +197,42 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
         elif intent == "proactive_reengage":
             state.last_reengage_sent_at = now_utc
 
+        # Flush отметок до отправки
+        try:
+            await session.flush()
+        except Exception:
+            logger.warning("proactive_flush_error_pre_send", intent=intent, chat_id=chat_id)
+
+        if getattr(state, "proactive_via_userbot", False):
+            session.add(ProactiveOutbox(chat_id=chat_id, intent=intent, text=resp.reply, meta_json=meta))
+        else:
+            try:
+                await bot.send_message(chat_id, resp.reply)
+                state.last_assistant_at = utcnow()
+                session.add(AssistantMessage(chat_id=chat_id, text=resp.reply, meta_json=meta))
+            except Exception as e:
+                logger.exception("proactive_send_error", intent=intent, chat_id=chat_id, error=str(e))
+                # отметку не откатываем — иначе зациклится
+
         # Немедленный flush чтобы штамп сохранился даже если остальные чаты вызовут сбой
+        # Финальный flush уже после отправки (оставляем для generic ниже)
         try:
             await session.flush()
         except Exception as e:
-            logger.warning("proactive_flush_error", intent=intent, chat_id=chat_id, error=str(e))
+            logger.warning("proactive_flush_error_post_send", intent=intent, chat_id=chat_id, error=str(e))
 
         if intent == "proactive_generic":
             base_time = state.last_assistant_at or utcnow()
             state.next_proactive_at = compute_next_proactive_at(base_time, settings)
 
         metrics.inc("proactive_sent_total", labels={"intent": intent})
+
+        # Пер-чата commit чтобы минимизировать вероятность повторов при сбоях далее
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.warning("proactive_commit_error", intent=intent, chat_id=chat_id)
 
 
 def start_scheduler(
