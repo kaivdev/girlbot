@@ -21,6 +21,8 @@ class ProactiveSettings(BaseModel):
     default_auto_messages: bool = True
     min_seconds: int = 3600
     max_seconds: int = 7200
+    # Enable/disable generic fallback intent via env PROACTIVE_GENERIC_ENABLED
+    generic_enabled: bool = True
 
 
 class ReplyDelaySettings(BaseModel):
@@ -106,6 +108,8 @@ class Settings(BaseSettings):
         self.proactive.default_auto_messages = _get_bool("AUTO_MESSAGES_DEFAULT", self.proactive.default_auto_messages)
         self.proactive.min_seconds = _get_int("PROACTIVE_MIN_SECONDS", self.proactive.min_seconds)
         self.proactive.max_seconds = _get_int("PROACTIVE_MAX_SECONDS", self.proactive.max_seconds)
+    # Optional: disable generic proactive via env
+    self.proactive.generic_enabled = _get_bool("PROACTIVE_GENERIC_ENABLED", self.proactive.generic_enabled)
 
         self.reply_delay.min_seconds = _get_int("REPLY_DELAY_MIN_SECONDS", self.reply_delay.min_seconds)
         self.reply_delay.max_seconds = _get_int("REPLY_DELAY_MAX_SECONDS", self.reply_delay.max_seconds)

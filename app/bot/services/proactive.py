@@ -133,7 +133,12 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
                     history_trim = True
 
         # Generic fallback (используем старый next_proactive_at механизм)
-        if not intent and state.next_proactive_at and state.next_proactive_at <= now_utc:
+        if (
+            not intent
+            and getattr(settings.proactive, "generic_enabled", True)
+            and state.next_proactive_at
+            and state.next_proactive_at <= now_utc
+        ):
             intent = "proactive_generic"
             history_trim = False
 

@@ -127,39 +127,52 @@ async def main() -> None:
     batch_quiet_grace = float(os.getenv("USERBOT_BATCH_QUIET_GRACE", "1.0"))  # сколько тишины нужно перед отправкой
     batch_max_messages = int(os.getenv("USERBOT_BATCH_MAX_MESSAGES", "5"))    # максимум объединяемых сообщений
     outbox_poll_seconds = float(os.getenv("USERBOT_OUTBOX_POLL_SECONDS", "10"))
+    cancel_on_new_msg = os.getenv("USERBOT_CANCEL_ON_NEW_MSG", "1").lower() in {"1","true","yes","on"}
 
     # Буфер по chat_id
     message_buffers: Dict[int, List[Message]] = {}
     buffer_tasks: Dict[int, asyncio.Task] = {}
+    inflight_tasks: Dict[int, asyncio.Task] = {}
+
+    def _start_generation(chat_id: int, base: Message, combined_text: str):
+        task = asyncio.create_task(_process_single(app, shim, base, combined_text))
+        inflight_tasks[chat_id] = task
+        def _cleanup(_):
+            # убрать из карты по завершению (успех/ошибка/отмена)
+            if inflight_tasks.get(chat_id) is task:
+                inflight_tasks.pop(chat_id, None)
+        task.add_done_callback(_cleanup)
+        return task
 
     async def flush_buffer(chat_id: int):
         msgs = message_buffers.get(chat_id, [])
         if not msgs:
             return
-        # Берём последний для метаданных, объединяем тексты
         base = msgs[-1]
-        user = base.from_user
         combined_text = " \n".join(m.text or "" for m in msgs)
         message_buffers[chat_id] = []
-        # Дальнейшая логика идентична одиночному сообщению: создаём «виртуальный» Message-подобный контекст
-        await _process_single(app, shim, base, combined_text)
+        _start_generation(chat_id, base, combined_text)
 
     async def schedule_buffer_send(chat_id: int):
-        # ждём пока либо тишина, либо истечёт max_wait
+        # ждём пока либо тишина >= batch_quiet_grace с момента последнего изменения,
+        # либо истечёт batch_max_wait с момента первого сообщения в буфере
         start = time.monotonic()
         last_len = len(message_buffers.get(chat_id, []))
+        last_change_ts = start
         while True:
             await asyncio.sleep(0.2)
             now = time.monotonic()
-            # если превысили max_wait — отправляем
+            # тишина достаточная?
+            if len(message_buffers.get(chat_id, [])) > 0 and (now - last_change_ts) >= batch_quiet_grace:
+                break
+            # превысили общий максимум ожидания
             if now - start >= batch_max_wait:
                 break
-            # если размер не меняется дольше grace и не пусто — завершаем
+            # отслеживаем изменения размера буфера
             current = len(message_buffers.get(chat_id, []))
-            if current == last_len and current > 0 and (now - start) >= batch_quiet_grace:
-                break
             if current != last_len:
                 last_len = current
+                last_change_ts = now
         await flush_buffer(chat_id)
         buffer_tasks.pop(chat_id, None)
 
@@ -281,6 +294,14 @@ async def main() -> None:
         if not batch_enabled:
             await _process_single(app, shim, message, message.text or "")
             return
+
+        # Если во время генерации пришло новое сообщение — по желанию отменяем генерацию
+        if cancel_on_new_msg:
+            task = inflight_tasks.get(message.chat.id)
+            if task and not task.done():
+                task.cancel()
+                with contextlib.suppress(Exception):
+                    await task
 
         buf = message_buffers.setdefault(message.chat.id, [])
         buf.append(message)
