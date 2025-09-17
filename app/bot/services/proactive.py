@@ -140,6 +140,17 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
         if not intent:
             continue
 
+        # Если используем userbot и уже есть неотправленные записи в outbox для этого чата — пропускаем,
+        # чтобы не накапливать очередь и не казаться спамером.
+        if getattr(state, "proactive_via_userbot", False):
+            pending_exists = await session.execute(
+                select(ProactiveOutbox.id).where(
+                    ProactiveOutbox.chat_id == state.chat_id, ProactiveOutbox.sent_at.is_(None)
+                ).limit(1)
+            )
+            if pending_exists.first() is not None:
+                continue
+
         # Advisory lock per chat внутри общей транзакции, чтобы параллельные процессы не дублировали
         try:
             lock_res = await session.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": state.chat_id})
@@ -205,6 +216,9 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
 
         if getattr(state, "proactive_via_userbot", False):
             session.add(ProactiveOutbox(chat_id=chat_id, intent=intent, text=resp.reply, meta_json=meta))
+            # Суррогатно обновим last_assistant_at, чтобы generic расписание не дергалось слишком часто
+            if not state.last_assistant_at:
+                state.last_assistant_at = now_utc
         else:
             try:
                 await bot.send_message(chat_id, resp.reply)
