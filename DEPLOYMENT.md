@@ -13,7 +13,6 @@
 - `PUBLIC_BASE_URL` (публичный HTTPS URL бота, напр. `https://girlbot.noza.digital`)
 - `N8N_WEBHOOK_URL` (Production URL workflow в n8n, напр. `https://n8n.noza.digital/webhook/ai-reply`)
 - `DB_DSN` (DSN Postgres)
-- Опционально: `OPENROUTER_REFERRER` — только ASCII-домен/URL (или пусто)
 
 ---
 
@@ -228,6 +227,5 @@ source .venv/bin/activate && pip install -r requirements.txt && alembic upgrade 
 - 502 Bad Gateway в getWebhookInfo — историческая ошибка nginx, если бот был недоступен. Если сейчас `pending_update_count=0` и всё работает, можно игнорировать или переустановить вебхук.
 - 404 на `/webhook/...` n8n — workflow не активирован или неверный метод. Проверять нужно POST; включите “Active”.
 - 500 `No item to return was found` — последний узел в n8n вернул 0 items. Добавьте fallback: `return [{ json: { reply: "Сервис занят, попробуйте позже", meta: {} } }];` и/или “Continue On Fail”.
-- Бот пишет “Сервис занят, попробуйте позже” — ошибка запроса к n8n. Проверьте `N8N_WEBHOOK_URL` и логи. Значение `OPENROUTER_REFERRER` должно быть ASCII‑URL или пустым.
 - n8n медленно отвечает — по умолчанию таймаут клиента 60с. При необходимости увеличьте (сделаем настраиваемым по запросу).
 

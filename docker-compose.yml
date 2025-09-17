@@ -17,7 +17,6 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
-      OPENROUTER_REFERRER: ${OPENROUTER_REFERRER}
       N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL}
       DB_DSN: postgresql+asyncpg://user:pass@db:5432/tgbot
       APP_HOST: 0.0.0.0
@@ -34,3 +33,30 @@ services:
     depends_on:
       db:
         condition: service_healthy
+
+  userbot:
+    build: .
+    command: python -m scripts.pyro_userbot
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      PYROGRAM_SESSION_STRING: ${PYROGRAM_SESSION_STRING}
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL}
+      DB_DSN: postgresql+asyncpg://user:pass@db:5432/tgbot
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      USERBOT_READ_BEFORE_TYPING: ${USERBOT_READ_BEFORE_TYPING:-1}
+      USERBOT_TYPING: ${USERBOT_TYPING:-1}
+      USERBOT_TYPING_INTERVAL: ${USERBOT_TYPING_INTERVAL:-4}
+      USERBOT_MIN_TYPING_SECONDS: ${USERBOT_MIN_TYPING_SECONDS:-3}
+      USERBOT_TYPING_START_DELAY_MIN: ${USERBOT_TYPING_START_DELAY_MIN:-2.5}
+      USERBOT_TYPING_START_DELAY_MAX: ${USERBOT_TYPING_START_DELAY_MAX:-5.0}
+      USERBOT_BATCH_ENABLED: ${USERBOT_BATCH_ENABLED:-1}
+      USERBOT_BATCH_MAX_WAIT: ${USERBOT_BATCH_MAX_WAIT:-4.0}
+      USERBOT_BATCH_QUIET_GRACE: ${USERBOT_BATCH_QUIET_GRACE:-1.2}
+      USERBOT_BATCH_MAX_MESSAGES: ${USERBOT_BATCH_MAX_MESSAGES:-6}
+    depends_on:
+      db:
+        condition: service_healthy
+      bot:
+        condition: service_started
+    restart: unless-stopped

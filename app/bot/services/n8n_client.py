@@ -44,17 +44,6 @@ async def call_n8n(req: N8nRequest, *, trace_id: str | None = None) -> N8nRespon
             headers["X-Trace-Id"] = trace_id
         else:
             get_logger().warning("skip_trace_id_non_ascii")
-    if settings.openrouter_referrer:
-        ref = settings.openrouter_referrer.strip()
-        if _is_ascii(ref):
-            # allow domain or full URL; normalize to URL
-            parsed = urlparse(ref if ref.startswith("http") else f"https://{ref}")
-            if parsed.scheme in {"http", "https"} and parsed.netloc:
-                headers["Referer"] = parsed.geturl()
-            else:
-                get_logger().warning("skip_referer_invalid", value=ref)
-        else:
-            get_logger().warning("skip_referer_non_ascii", value_preview=ref[:32])
 
     payload = req.model_dump(mode="json")
     start = perf_counter()

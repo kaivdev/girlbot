@@ -78,11 +78,16 @@ async def main() -> None:
     load_dotenv()
     settings = get_settings()
 
-    api_id = int(os.getenv("TELEGRAM_API_ID", "0"))
+    raw_api_id = os.getenv("TELEGRAM_API_ID")
     api_hash = os.getenv("TELEGRAM_API_HASH")
     session_string: Optional[str] = os.getenv("PYROGRAM_SESSION_STRING")
-    if not api_id or not api_hash:
-        raise RuntimeError("Please set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env")
+    if not raw_api_id or not raw_api_id.strip():
+        raise RuntimeError("TELEGRAM_API_ID is empty or not set (add to .env / service env)")
+    if not raw_api_id.isdigit():
+        raise RuntimeError(f"TELEGRAM_API_ID must be digits, got: {raw_api_id!r}")
+    api_id = int(raw_api_id)
+    if not api_hash or not api_hash.strip():
+        raise RuntimeError("TELEGRAM_API_HASH is empty or not set (add to .env / service env)")
 
     if session_string:
         app = Client(name="userbot", api_id=api_id, api_hash=api_hash, session_string=session_string)

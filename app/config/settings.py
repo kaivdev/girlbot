@@ -56,8 +56,6 @@ class Settings(BaseSettings):
     public_base_url: AnyHttpUrl
     n8n_webhook_url: AnyHttpUrl
 
-    # Optional headers for n8n/OpenRouter attribution
-    openrouter_referrer: Optional[str] = None
 
     # Database
     db_dsn: PostgresDsn
