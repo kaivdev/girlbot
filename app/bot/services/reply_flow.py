@@ -19,6 +19,7 @@ from app.db.models import AssistantMessage, Chat, ChatState, Event, Message, Use
 from app.utils.time import future_with_jitter, utcnow
 from datetime import timedelta
 import random
+import re
 
 GOODNIGHT_KEYWORDS = [
     "споки", "спокойной", "доброй ночи", "споки ноки", "споки-ноки", "на ночь", "пора спать", "иду спать"
@@ -30,6 +31,20 @@ def _normalize(txt: str) -> str:
 def _has_goodnight(text: str) -> bool:
     t = _normalize(text)
     return any(k in t for k in GOODNIGHT_KEYWORDS)
+
+
+ABUSE_PATTERNS = [
+    r"\b(сука|шлюх|туп(ая|ой)|идиот|дебил|мразь|тварь|урод|еблан|нахуй|выеб|пошел\s*нах)\b",
+    r"\b(fuck|bitch|whore|slut|stupid|idiot|moron|retard)\b",
+]
+
+
+def is_abusive(text: str) -> bool:
+    t = _normalize(text)
+    for pat in ABUSE_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return True
+    return False
 
 
 async def ensure_entities(
@@ -137,6 +152,27 @@ async def process_user_text(
     if getattr(state, "sleep_until", None) and state.sleep_until and state.sleep_until > now:
         # Не отвечаем, тихий игнор
         return "(sleep)"
+
+    # Moderation: если пользователь оскорбляет — включаем «грубый» ответ и/или мьют
+    try:
+        if getattr(settings, "moderation", None) and settings.moderation.abuse_enabled and is_abusive(trimmed):
+            # Включаем короткий резкий ответ и мьют до now + abuse_mute_hours
+            mute_until = now + timedelta(hours=settings.moderation.abuse_mute_hours)
+            state.sleep_until = mute_until
+            history = []
+            ctx = Context(history=history, last_user_msg_at=state.last_user_msg_at, last_assistant_at=state.last_assistant_at)
+            chat_info = ChatInfo(chat_id=chat_id, user_id=user_id, lang=lang, username=username, persona=getattr(state, "persona_key", None), memory_rev=getattr(state, "memory_rev", None))
+            req = N8nRequest(intent="reply", chat=chat_info, context=ctx, message=MessageIn(text="[abuse_detected] " + trimmed), trace_id=trace_id)
+            try:
+                n8n_resp = await call_n8n(req, trace_id=trace_id)
+                reply_text = n8n_resp.reply
+            except Exception:
+                reply_text = "Не перегибай. Вернусь позже."
+            await bot.send_message(chat_id, reply_text)
+            state.last_assistant_at = utcnow()
+            return reply_text
+    except Exception:
+        pass
 
     # Определение quiet окна
     def _parse_window(win: str | None):
@@ -258,6 +294,30 @@ async def process_user_text(
         await bot.send_message(chat_id, msg)
         metrics.inc("n8n_errors_total", labels={"intent": "reply"})
         return msg
+
+    # Если n8n пометил сообщение как оскорбительное — сразу уходим в «сон» на указанный срок
+    try:
+        meta_obj = getattr(n8n_resp, "meta", None)
+        abuse_flag = None
+        mute_hours = None
+        if meta_obj is not None:
+            abuse_flag = getattr(meta_obj, "abuse", None)
+            mute_hours = getattr(meta_obj, "mute_hours", None)
+            # Дополнительно поддержим вложенный словарь flags, если он появится
+            flags = getattr(meta_obj, "flags", None)
+            if abuse_flag is None and isinstance(flags, dict):
+                abuse_flag = flags.get("abuse")
+                if mute_hours is None:
+                    mh = flags.get("mute_hours")
+                    mute_hours = mh if isinstance(mh, (int, float)) else None
+        if abuse_flag is True:
+            try:
+                hours = float(mute_hours) if mute_hours is not None else float(getattr(getattr(settings, "moderation", object()), "abuse_mute_hours", 12))
+            except Exception:
+                hours = float(getattr(getattr(settings, "moderation", object()), "abuse_mute_hours", 12))
+            state.sleep_until = utcnow() + timedelta(hours=hours)
+    except Exception:
+        pass
 
     # --- Логика определения задержки ответа ---
     # Определяем предыдущую активность до текущего сообщения пользователя

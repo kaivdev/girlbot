@@ -56,6 +56,10 @@ class ReplyDelaySettings(BaseModel):
 class AntiSpamSettings(BaseModel):
     user_min_seconds_between_msg: int = 5
 
+class ModerationSettings(BaseModel):
+    abuse_enabled: bool = True
+    abuse_mute_hours: int = 24
+
 
 class Settings(BaseSettings):
     """Top-level application configuration."""
@@ -88,6 +92,7 @@ class Settings(BaseSettings):
     proactive: ProactiveSettings = ProactiveSettings()
     reply_delay: ReplyDelaySettings = ReplyDelaySettings()
     antispam: AntiSpamSettings = AntiSpamSettings()
+    moderation: ModerationSettings = ModerationSettings()
 
     # Proactive extended windows (HH:MM-HH:MM). Quiet hours, morning, evening
     proactive_morning_window: str | None = None  # e.g. "07:00-09:30"
@@ -145,6 +150,9 @@ class Settings(BaseSettings):
         self.antispam.user_min_seconds_between_msg = _get_int_env(
             "USER_MIN_SECONDS_BETWEEN_MSG", self.antispam.user_min_seconds_between_msg
         )
+        # Moderation
+        self.moderation.abuse_enabled = _get_bool_env("ABUSE_ENABLED", self.moderation.abuse_enabled)
+        self.moderation.abuse_mute_hours = _get_int_env("ABUSE_MUTE_HOURS", self.moderation.abuse_mute_hours)
         # Nothing else: окна читаем как строки, числа уже есть
 
 

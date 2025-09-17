@@ -87,6 +87,20 @@ class ChatState(Base):
     proactive_via_userbot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     # Когда в последний раз применяли увеличенную задержку после длинной паузы
     last_long_pause_reply_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    # === Система защиты от агрессии ===
+    # Текущий уровень агрессии пользователя (0-3)
+    aggression_level: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Время первого оскорбления в текущей сессии
+    first_aggression_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Время последнего агрессивного сообщения
+    last_aggression_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Количество агрессивных сообщений в текущей сессии
+    aggression_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Заблокирован ли пользователь до определенного времени
+    blocked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Количество предупреждений выдано
+    warnings_given: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     chat: Mapped[Chat] = relationship(back_populates="state")
 
