@@ -492,7 +492,7 @@ async def main() -> None:
                 with contextlib.suppress(Exception):
                     await typing_task
 
-    @app.on_message(((filters.photo) | (filters.document & filters.mime_type("image/*"))) & ~filters.me)
+    @app.on_message(((filters.photo) | (filters.document)) & ~filters.me)
     async def handle_photo(_: Client, message: Message):
         # Обрабатываем только адресованные нам сообщения
         if not my_id_box:
@@ -502,6 +502,11 @@ async def main() -> None:
             return
         if message.from_user and getattr(message.from_user, "is_bot", False):
             return
+
+        # Если это документ, но не изображение — пропускаем
+        if getattr(message, "document", None) and getattr(message.document, "mime_type", None):
+            if not str(message.document.mime_type).startswith("image/"):
+                return
 
         typing_task = asyncio.create_task(typing_loop(app, message.chat.id, 4.0))
         try:
@@ -524,10 +529,10 @@ async def main() -> None:
                 except Exception:
                     image_file_id = None
             if getattr(message, "document", None) and getattr(message.document, "mime_type", None):
-                if str(message.document.mime_type).startswith("image/"):
-                    mime = message.document.mime_type
-                    filename = message.document.file_name or filename
-                    image_file_id = message.document.file_id
+                # document тут гарантированно image/* благодаря проверке выше
+                mime = message.document.mime_type
+                filename = message.document.file_name or filename
+                image_file_id = message.document.file_id
 
             upload_url = str(settings.public_base_url).rstrip("/") + "/upload"
             try:
