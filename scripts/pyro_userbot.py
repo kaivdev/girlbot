@@ -31,7 +31,7 @@ from pyrogram.types import Message
 from app.config.settings import get_settings
 from app.db.base import session_scope
 from app.bot.services.reply_flow import process_user_text
-from app.db.models import ProactiveOutbox, AssistantMessage, ChatState, Message as DBMessage
+from app.db.models import ProactiveOutbox, AssistantMessage, ChatState, Message as DBMessage, Chat
 from app.utils.time import utcnow
 
 
@@ -369,6 +369,13 @@ async def main() -> None:
         async with session_scope() as session:
             await session.execute(delete(DBMessage).where(DBMessage.chat_id == chat_id))
             await session.execute(delete(AssistantMessage).where(AssistantMessage.chat_id == chat_id))
+            
+            # Убедимся, что запись чата существует
+            chat = await session.get(Chat, chat_id)
+            if chat is None:
+                chat = Chat(id=chat_id)
+                session.add(chat)
+            
             state = await session.get(ChatState, chat_id)
             if state is None:
                 state = ChatState(chat_id=chat_id)
