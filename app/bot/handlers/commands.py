@@ -144,6 +144,7 @@ async def cmd_reset(message: Message) -> None:
         
         # reset aggression fields
         state.blocked_until = None
+        state.sleep_until = None  # Это главное для сброса блокировки!
         state.aggression_level = None
         state.aggression_count = None
         state.warnings_given = None
