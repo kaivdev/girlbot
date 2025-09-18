@@ -18,6 +18,7 @@ import contextlib
 import os
 import random
 from contextlib import asynccontextmanager
+from io import BytesIO
 from typing import Optional, Dict, List
 import time
 from collections import deque
@@ -27,6 +28,7 @@ from sqlalchemy import delete
 from pyrogram import Client, filters
 from pyrogram.enums import ChatAction, ChatType
 from pyrogram.types import Message
+import httpx
 
 from app.config.settings import get_settings
 from app.db.base import session_scope
@@ -229,7 +231,7 @@ async def main() -> None:
         await flush_buffer(chat_id)
         buffer_tasks.pop(chat_id, None)
 
-    async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str):
+    async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None):
         # Lazy initialize my own user id
         if not my_id_box:
             me = await app.get_me()
@@ -299,6 +301,7 @@ async def main() -> None:
                         username=(user.username if user else None),
                         lang=(getattr(user, "language_code", None) if user else None),
                         text=text,
+                        media=media,
                         settings=settings,
                         trace_id=None,
                     )
@@ -427,6 +430,67 @@ async def main() -> None:
         # Если нет активного таска — запускаем
         if message.chat.id not in buffer_tasks:
             buffer_tasks[message.chat.id] = asyncio.create_task(schedule_buffer_send(message.chat.id))
+
+    @app.on_message((filters.voice | filters.audio) & ~filters.me)
+    async def handle_voice(_: Client, message: Message):
+        # Обрабатываем только адресованные нам сообщения
+        if not my_id_box:
+            me = await app.get_me()
+            my_id_box["id"] = me.id
+        if not _is_for_me(message, my_id_box["id"]):
+            return
+        if message.from_user and getattr(message.from_user, "is_bot", False):
+            return
+
+        # Индикация "печатает" пока обрабатываем
+        typing_task = asyncio.create_task(typing_loop(app, message.chat.id, 4.0))
+        try:
+            # Скачиваем в память и загружаем на наш backend /upload
+            bio: BytesIO = await message.download(in_memory=True)  # type: ignore[assignment]
+            # Определяем имя и mime
+            mime: str = "application/octet-stream"
+            filename: str = "audio.bin"
+            duration: Optional[int] = None
+            voice_file_id: Optional[str] = None
+            if message.voice:
+                filename = "voice.ogg"
+                mime = getattr(message.voice, "mime_type", None) or "audio/ogg"
+                duration = getattr(message.voice, "duration", None)
+                voice_file_id = getattr(message.voice, "file_id", None)
+            elif message.audio:
+                filename = message.audio.file_name or "audio.mp3"
+                mime = getattr(message.audio, "mime_type", None) or "audio/mpeg"
+                duration = getattr(message.audio, "duration", None)
+                voice_file_id = getattr(message.audio, "file_id", None)
+
+            upload_url = str(settings.public_base_url).rstrip("/") + "/upload"
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as hc:
+                    files = {"file": (filename, bio.getvalue(), mime)}
+                    resp = await hc.post(upload_url, files=files)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    audio_url = data.get("url")
+                    if not audio_url:
+                        raise RuntimeError("empty upload url")
+            except Exception:
+                await app.send_message(message.chat.id, "Не получилось обработать голос, пришли текстом?")
+                return
+
+            # Отправляем в общий поток с медиаметаданными; текст – плейсхолдер
+            media = {
+                "origin": "voice",
+                "audio_url": audio_url,
+                "voice_file_id": voice_file_id,
+                "mime_type": mime,
+                "duration": duration,
+            }
+            await _process_single(app, shim, message, "[voice_message]", media)
+        finally:
+            if typing_task and not typing_task.cancelled():
+                typing_task.cancel()
+                with contextlib.suppress(Exception):
+                    await typing_task
 
     print("[userbot] starting... press Ctrl+C to stop")
     await app.start()

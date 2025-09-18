@@ -97,6 +97,7 @@ async def process_user_text(
     username: Optional[str],
     lang: Optional[str],
     text: str,
+    media: dict | None = None,
     settings: Settings,
     trace_id: Optional[str] = None,
 ) -> str:
@@ -128,12 +129,20 @@ async def process_user_text(
     prev_user_ts = state.last_user_msg_at
     state.last_user_msg_at = now
 
-    # Универсальная поддержка /wake (в т.ч. через userbot), даже если sleep активен.
+    # Универсальная поддержка /wake и /reset (в т.ч. через userbot), даже если sleep активен.
     lowered = trimmed.lower()
     if lowered.startswith("/wake"):
         if getattr(state, "sleep_until", None):
             state.sleep_until = None
         reply = "Я проснулась, можем продолжать ☀️"
+        await bot.send_message(chat_id, reply)
+        state.last_assistant_at = utcnow()
+        return reply
+    elif lowered.startswith("/reset"):
+        # Сброс состояния как в команде reset
+        if getattr(state, "sleep_until", None):
+            state.sleep_until = None
+        reply = "Контекст очищен: история сброшена, память перезапущена. Можешь продолжать."
         await bot.send_message(chat_id, reply)
         state.last_assistant_at = utcnow()
         return reply
@@ -278,7 +287,19 @@ async def process_user_text(
         persona=getattr(state, "persona_key", None),
         memory_rev=getattr(state, "memory_rev", None),
     )
-    req = N8nRequest(intent="reply", chat=chat_info, context=ctx, message=MessageIn(text=trimmed), trace_id=trace_id)
+    # Build message payload, optionally carrying media metadata for n8n STT branch
+    msg_payload = {
+        "text": trimmed,
+    }
+    if isinstance(media, dict) and media:
+        msg_payload.update(media)
+    req = N8nRequest(
+        intent="reply",
+        chat=chat_info,
+        context=ctx,
+        message=MessageIn.model_validate(msg_payload),
+        trace_id=trace_id,
+    )
 
     # Call n8n
     logger = get_logger().bind(chat_id=chat_id, user_id=user_id, intent="reply", trace_id=trace_id)

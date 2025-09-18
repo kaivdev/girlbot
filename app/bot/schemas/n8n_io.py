@@ -31,6 +31,16 @@ class ChatInfo(BaseModel):
 
 class MessageIn(BaseModel):
     text: Optional[str] = None
+    # Optional media fields for voice/audio workflows handled in n8n
+    origin: Optional[Literal["text", "voice", "audio"]] = None
+    audio_url: Optional[str] = None  # direct URL n8n can download
+    voice_file_id: Optional[str] = None  # Telegram file_id (if n8n will resolve)
+    mime_type: Optional[str] = None
+    duration: Optional[int] = None  # seconds
+
+    model_config = {
+        "extra": "allow",  # allow further media-specific fields if needed
+    }
 
 
 class N8nRequest(BaseModel):

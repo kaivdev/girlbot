@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-"""FastAPI app entry: webhook, healthz, metrics."""
+"""FastAPI app entry: webhook, healthz, metrics, plus simple file upload/serve."""
 
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi.responses import PlainTextResponse, FileResponse
 import structlog
 
 from app.bot.loader import setup_bot
@@ -51,3 +52,41 @@ async def healthz() -> str:
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics_endpoint() -> str:
     return metrics.to_prometheus()
+
+
+# --- Simple upload/serve for voice/audio to be consumed by n8n ---
+_UPLOAD_DIR = Path("/tmp/uploads")
+_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)) -> dict:
+    settings = get_settings()
+    # Preserve a safe extension
+    suffix = ""
+    name = (file.filename or "upload.bin").lower()
+    for ext in (".ogg", ".oga", ".mp3", ".m4a", ".wav", ".webm", ".amr"):
+        if name.endswith(ext):
+            suffix = ext
+            break
+    fname = f"{uuid.uuid4().hex}{suffix}"
+    fpath = _UPLOAD_DIR / fname
+
+    # Save to disk in chunks
+    with fpath.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+
+    url = str(settings.public_base_url).rstrip("/") + f"/files/{fname}"
+    return {"url": url, "filename": fname, "mime_type": file.content_type}
+
+
+@app.get("/files/{fname}")
+async def serve_file(fname: str):
+    fpath = _UPLOAD_DIR / fname
+    if not fpath.exists() or not fpath.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(str(fpath))
