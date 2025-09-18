@@ -141,6 +141,14 @@ async def cmd_reset(message: Message) -> None:
         state.last_assistant_at = None
         state.next_proactive_at = None
         state.memory_rev = (state.memory_rev or 1) + 1
+        
+        # reset aggression fields
+        state.blocked_until = None
+        state.aggression_level = None
+        state.aggression_count = None
+        state.warnings_given = None
+        state.first_aggression_at = None
+        state.last_aggression_at = None
 
     await message.answer("Контекст очищен: история сброшена, память перезапущена. Можешь продолжать.")
 
