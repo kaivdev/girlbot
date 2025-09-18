@@ -136,6 +136,30 @@ docker run -d --name n8n \
 
 ---
 
+Пересобери и подними:
+docker compose build
+docker compose up -d bot userbot
+
+Проверить логи userbot:
+docker compose logs -f userbot
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## Вариант B — без Docker (venv + systemd)
 
 ### 1) Установка зависимостей

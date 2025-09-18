@@ -27,3 +27,11 @@ def test_n8n_request_response_models():
     assert resp.meta.model == "gpt"
     assert resp.meta.tokens == 42
 
+
+def test_message_in_allows_image_fields():
+    from app.bot.schemas.n8n_io import MessageIn
+    m = MessageIn(text="[photo]", origin="photo", image_url="https://x/y.jpg", width=800, height=600)
+    d = m.model_dump()
+    assert d["origin"] == "photo"
+    assert d["image_url"].endswith(".jpg")
+

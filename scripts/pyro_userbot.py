@@ -492,6 +492,75 @@ async def main() -> None:
                 with contextlib.suppress(Exception):
                     await typing_task
 
+    @app.on_message(((filters.photo) | (filters.document & filters.mime_type("image/*"))) & ~filters.me)
+    async def handle_photo(_: Client, message: Message):
+        # Обрабатываем только адресованные нам сообщения
+        if not my_id_box:
+            me = await app.get_me()
+            my_id_box["id"] = me.id
+        if not _is_for_me(message, my_id_box["id"]):
+            return
+        if message.from_user and getattr(message.from_user, "is_bot", False):
+            return
+
+        typing_task = asyncio.create_task(typing_loop(app, message.chat.id, 4.0))
+        try:
+            # Скачиваем изображение (Pyrogram сам возьмёт лучший размер для photo)
+            bio: BytesIO = await message.download(in_memory=True)  # type: ignore[assignment]
+            mime: str = "image/jpeg"
+            filename: str = "photo.jpg"
+            width = None
+            height = None
+            image_file_id = None
+            if getattr(message, "photo", None):
+                p = message.photo
+                try:
+                    width = getattr(p, "width", None)
+                    height = getattr(p, "height", None)
+                except Exception:
+                    pass
+                try:
+                    image_file_id = getattr(p, "file_id", None)
+                except Exception:
+                    image_file_id = None
+            if getattr(message, "document", None) and getattr(message.document, "mime_type", None):
+                if str(message.document.mime_type).startswith("image/"):
+                    mime = message.document.mime_type
+                    filename = message.document.file_name or filename
+                    image_file_id = message.document.file_id
+
+            upload_url = str(settings.public_base_url).rstrip("/") + "/upload"
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as hc:
+                    files = {"file": (filename, bio.getvalue(), mime)}
+                    resp = await hc.post(upload_url, files=files)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    image_url = data.get("url")
+                    if not image_url:
+                        raise RuntimeError("empty upload url")
+            except Exception:
+                await app.send_message(message.chat.id, "Не получилось обработать фото, пришли текстом?")
+                return
+
+            media = {
+                "origin": "photo",
+                "image_url": image_url,
+                "image_file_id": image_file_id,
+                "image_mime_type": mime,
+            }
+            if width:
+                media["width"] = width
+            if height:
+                media["height"] = height
+
+            await _process_single(app, shim, message, "[photo]", media)
+        finally:
+            if typing_task and not typing_task.cancelled():
+                typing_task.cancel()
+                with contextlib.suppress(Exception):
+                    await typing_task
+
     print("[userbot] starting... press Ctrl+C to stop")
     await app.start()
     # Отметим все новые чаты как proactive_via_userbot=True (если нужно поведение проактивов через userbot)

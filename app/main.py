@@ -65,7 +65,12 @@ async def upload_file(file: UploadFile = File(...)) -> dict:
     # Preserve a safe extension
     suffix = ""
     name = (file.filename or "upload.bin").lower()
-    for ext in (".ogg", ".oga", ".mp3", ".m4a", ".wav", ".webm", ".amr"):
+    for ext in (
+        # audio
+        ".ogg", ".oga", ".mp3", ".m4a", ".wav", ".webm", ".amr",
+        # images
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic",
+    ):
         if name.endswith(ext):
             suffix = ext
             break
