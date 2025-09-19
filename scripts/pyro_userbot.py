@@ -32,7 +32,7 @@ import httpx
 
 from app.config.settings import get_settings
 from app.db.base import session_scope
-from app.bot.services.reply_flow import process_user_text, buffer_or_process, flush_pending_input
+from app.bot.services.reply_flow import process_user_text, buffer_or_process, flush_pending_input, flush_expired_pending_input
 from app.db.models import ProactiveOutbox, AssistantMessage, ChatState, Message as DBMessage, Chat
 from app.utils.time import utcnow
 
@@ -140,10 +140,12 @@ async def main() -> None:
     def _new_threshold() -> int:
         return random.randint(reply_quote_every_min, reply_quote_every_max)
 
+    # Стратегия выбора сообщения для ответа зафиксирована: всегда последнее входящее
+    reply_quote_strategy = "last"
+
     def _select_reply_to(chat_id: int) -> Optional[int]:
         if not reply_quote_enabled:
             return None
-        # init structures
         cnt = reply_counters.get(chat_id, 0) + 1
         reply_counters[chat_id] = cnt
         thr = reply_thresholds.get(chat_id)
@@ -151,20 +153,21 @@ async def main() -> None:
             thr = _new_threshold()
             reply_thresholds[chat_id] = thr
         if cnt >= thr:
-            # reset for next cycle
             reply_counters[chat_id] = 0
             reply_thresholds[chat_id] = _new_threshold()
             dq = recent_user_msgs.get(chat_id)
             if dq and len(dq) > 0:
-                # pick a random recent message id to reply to
                 try:
-                    idx = random.randrange(0, len(dq))
-                    return list(dq)[idx]
-                except Exception:
-                    try:
+                    if reply_quote_strategy == "last":
                         return dq[-1]
-                    except Exception:
-                        return None
+                    elif reply_quote_strategy == "first":
+                        return dq[0]
+                    else:  # random
+                        idx = random.randrange(0, len(dq))
+                        return list(dq)[idx]
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        return dq[-1]
         return None
 
     shim = PyroBotShim(app, reply_selector=_select_reply_to, suppress_errors=True)
@@ -443,14 +446,32 @@ async def main() -> None:
         dq.append(message.id)
 
         if not batch_enabled:
-            # Проверим, есть ли активный фото-буфер (для склейки текста после фото)
-            use_buffer = False
+            # Попробуем сначала только истекший буфер сбросить. Если буфер активен (фото) и не истёк — просто расширяем его.
             async with session_scope() as session:
                 state = await session.get(ChatState, message.chat.id)
                 pending = getattr(state, 'pending_input_json', None) if state else None
-                if pending and pending.get('media') and pending['media'].get('origin') == 'photo':
-                    use_buffer = True
-            await _process_single(app, shim, message, message.text or "", use_buffer=use_buffer)
+                pending_is_photo = bool(pending and pending.get('media') and pending['media'].get('origin') == 'photo')
+                if pending_is_photo:
+                    # Если дедлайны истекли – flush, тогда текст станет новым буфером / сообщением.
+                    flushed = await flush_expired_pending_input(shim, session, chat_id=message.chat.id, settings=get_settings())
+                    if not flushed:
+                        # Буфер активен и не истёк – просто расширяем.
+                        await buffer_or_process(
+                            shim,
+                            session,
+                            chat_id=message.chat.id,
+                            chat_type=_chat_type_str(message.chat.type),
+                            user_id=(message.from_user.id if message.from_user else None),
+                            username=(message.from_user.username if message.from_user else None),
+                            lang=(getattr(message.from_user, 'language_code', None) if message.from_user else None),
+                            text=message.text or "",
+                            media=None,
+                            settings=get_settings(),
+                            trace_id=None,
+                        )
+                        return
+            # Если не было активного фото-буфера или он сброшен – обычная обработка (с проверкой на старт нового буфера в _process_single при use_buffer)
+            await _process_single(app, shim, message, message.text or "")
             return
 
         # Если во время генерации пришло новое сообщение — по желанию отменяем генерацию

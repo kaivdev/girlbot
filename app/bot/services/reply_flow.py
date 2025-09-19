@@ -121,6 +121,38 @@ async def flush_pending_input(
         trace_id=trace_id,
     )
 
+async def flush_expired_pending_input(
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    settings: Settings,
+    trace_id: str | None = None,
+) -> bool:
+    """Проверяет дедлайны буфера и делает flush ТОЛЬКО если они истекли.
+
+    Возвращает True если был выполнен flush, иначе False.
+    """
+    state = await session.get(ChatState, chat_id)
+    if not state or not getattr(state, 'pending_input_json', None):
+        return False
+    payload = state.pending_input_json or {}
+    from datetime import datetime as _dt
+    def _parse(s: str | None):
+        if not s:
+            return None
+        try:
+            return _dt.fromisoformat(s)
+        except Exception:
+            return None
+    now_local = utcnow()
+    da = _parse(payload.get('deadline_at'))
+    aa = _parse(payload.get('absolute_deadline_at'))
+    if (aa and now_local >= aa) or (da and now_local >= da):
+        await flush_pending_input(bot, session, chat_id=chat_id, settings=settings, trace_id=trace_id)
+        return True
+    return False
+
 
 async def buffer_or_process(
     bot: Bot,
