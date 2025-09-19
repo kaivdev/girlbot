@@ -447,6 +447,7 @@ async def main() -> None:
         await app.send_message(chat_id, "Контекст очищен: история сброшена, память перезапущена. Можешь продолжать.")
 
     use_queue = os.getenv("USERBOT_QUEUE_ENABLED", "1").lower() in {"1","true","yes","on"}
+    get_logger().info("queue_init", enabled=use_queue)
 
     async def _enqueue_incoming(message: Message, combined_text: str, media: Optional[Dict] = None, source: str = "live"):
         async with session_scope() as session:
@@ -803,7 +804,7 @@ async def main() -> None:
                                 text=payload.get("text", ""),
                                 media=payload.get("media"),
                                 settings=settings,
-                                trace_id=None,
+                                trace_id=payload.get("trace_id"),
                                 tg_message_id=payload.get("telegram_message_id"),
                             )
                             await complete(session, t.id, status="done")
