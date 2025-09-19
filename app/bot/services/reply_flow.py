@@ -541,15 +541,19 @@ async def process_user_text(
     try:
         n8n_resp = await call_n8n(req, trace_id=trace_id)
     except Exception as e:
-        # On error: notify softly and log event
         logger.error("n8n_call_failed", exc_info=True, error=str(e))
-        session.add(
-            Event(kind="n8n_error", chat_id=chat_id, user_id=user_id, payload_json={"intent": "reply"})
-        )
-        msg = "Сервис занят, попробуйте позже"
-        await bot.send_message(chat_id, msg)
+        session.add(Event(kind="n8n_error", chat_id=chat_id, user_id=user_id, payload_json={"intent": "reply"}))
         metrics.inc("n8n_errors_total", labels={"intent": "reply"})
-        return msg
+        # Если бот не в режиме подавления — отправляем уведомление
+        if not getattr(bot, "suppress_errors", False):
+            msg = "Сервис занят, попробуйте позже"
+            try:
+                await bot.send_message(chat_id, msg)
+            except Exception:
+                pass
+            return msg
+        # suppress: просто молча вернуть технический маркер
+        return "(n8n_error_suppressed)"
 
     # Если n8n пометил сообщение как оскорбительное — сразу уходим в «сон» на указанный срок
     try:
@@ -688,23 +692,14 @@ async def process_user_text(
     if delay_seconds <= 0:
         pass  # immediate
     elif delay_seconds <= 30:
-        # Короткая задержка — имитируем activity + ждём inline
-        typing_action = "typing"
-        if media_origin == "photo":
-            typing_action = "upload_photo"  # можно сменить позже на просто typing
-        elif media_origin in {"voice", "audio"}:
-            typing_action = "record_voice"
-        asyncio.create_task(_typing_loop(typing_action, delay_seconds))
+        # Короткая задержка — единая индикация печатает
+        asyncio.create_task(_typing_loop("typing", delay_seconds))
         await asyncio.sleep(delay_seconds)
     else:
         # Длинная задержка: отпускаем функцию сразу, создаём фоновую задачу
         async def _delayed_send(text_to_send: str, ds: float, chat_id_local: int, meta_local: dict, dkind: str):
-            typing_action = "typing"
-            if media_origin == "photo":
-                typing_action = "upload_photo"
-            elif media_origin in {"voice", "audio"}:
-                typing_action = "record_voice"
-            asyncio.create_task(_typing_loop(typing_action, ds))
+            # Для длинной задержки тоже всегда показываем "typing"
+            asyncio.create_task(_typing_loop("typing", ds))
             await asyncio.sleep(ds)
             try:
                 await bot.send_message(chat_id_local, text_to_send)

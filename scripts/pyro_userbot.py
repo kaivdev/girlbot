@@ -32,7 +32,7 @@ import httpx
 
 from app.config.settings import get_settings
 from app.db.base import session_scope
-from app.bot.services.reply_flow import process_user_text
+from app.bot.services.reply_flow import process_user_text, buffer_or_process, flush_pending_input
 from app.db.models import ProactiveOutbox, AssistantMessage, ChatState, Message as DBMessage, Chat
 from app.utils.time import utcnow
 
@@ -40,9 +40,10 @@ from app.utils.time import utcnow
 class PyroBotShim:
     """Minimal shim to satisfy process_user_text(bot=...)."""
 
-    def __init__(self, client: Client, reply_selector: Optional[callable] = None):
+    def __init__(self, client: Client, reply_selector: Optional[callable] = None, suppress_errors: bool = True):
         self.client = client
         self.reply_selector = reply_selector
+        self.suppress_errors = suppress_errors
 
     async def send_message(self, chat_id: int, text: str):  # aiogram-like surface
         reply_to_id = None
@@ -166,7 +167,7 @@ async def main() -> None:
                         return None
         return None
 
-    shim = PyroBotShim(app, reply_selector=_select_reply_to)
+    shim = PyroBotShim(app, reply_selector=_select_reply_to, suppress_errors=True)
 
     # Userbot behavior configuration (env overrides)
     # Поведение прочтения:
@@ -247,7 +248,7 @@ async def main() -> None:
         await flush_buffer(chat_id)
         buffer_tasks.pop(chat_id, None)
 
-    async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False):
+    async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False, use_buffer: bool = False):
         # Lazy initialize my own user id
         if not my_id_box:
             me = await app.get_me()
@@ -308,19 +309,39 @@ async def main() -> None:
             cancelled = False
             async with session_scope() as session:
                 try:
-                    await process_user_text(
-                        shim,
-                        session,
-                        chat_id=chat.id,
-                        chat_type=_chat_type_str(chat.type),
-                        user_id=(user.id if user else None),
-                        username=(user.username if user else None),
-                        lang=(getattr(user, "language_code", None) if user else None),
-                        text=text,
-                        media=media,
-                        settings=settings,
-                        trace_id=None,
-                    )
+                    if use_buffer:
+                        # Перед добавлением текста пробуем авто-флаш просроченного буфера
+                        await flush_pending_input(shim, session, chat_id=chat.id, settings=settings)
+                        marker = await buffer_or_process(
+                            shim,
+                            session,
+                            chat_id=chat.id,
+                            chat_type=_chat_type_str(chat.type),
+                            user_id=(user.id if user else None),
+                            username=(user.username if user else None),
+                            lang=(getattr(user, "language_code", None) if user else None),
+                            text=text,
+                            media=media,
+                            settings=settings,
+                            trace_id=None,
+                        )
+                        # Если просто буфер — ответа сейчас не будет
+                        if marker in {"(buffer_started)", "(buffer_extended)"}:
+                            return
+                    else:
+                        await process_user_text(
+                            shim,
+                            session,
+                            chat_id=chat.id,
+                            chat_type=_chat_type_str(chat.type),
+                            user_id=(user.id if user else None),
+                            username=(user.username if user else None),
+                            lang=(getattr(user, "language_code", None) if user else None),
+                            text=text,
+                            media=media,
+                            settings=settings,
+                            trace_id=None,
+                        )
                 except asyncio.CancelledError:
                     cancelled = True
                     with contextlib.suppress(Exception):
@@ -422,7 +443,14 @@ async def main() -> None:
         dq.append(message.id)
 
         if not batch_enabled:
-            await _process_single(app, shim, message, message.text or "")
+            # Проверим, есть ли активный фото-буфер (для склейки текста после фото)
+            use_buffer = False
+            async with session_scope() as session:
+                state = await session.get(ChatState, message.chat.id)
+                pending = getattr(state, 'pending_input_json', None) if state else None
+                if pending and pending.get('media') and pending['media'].get('origin') == 'photo':
+                    use_buffer = True
+            await _process_single(app, shim, message, message.text or "", use_buffer=use_buffer)
             return
 
         # Если во время генерации пришло новое сообщение — по желанию отменяем генерацию
@@ -489,7 +517,7 @@ async def main() -> None:
                     if not audio_url:
                         raise RuntimeError("empty upload url")
             except Exception:
-                await app.send_message(message.chat.id, "Не получилось обработать голос, пришли текстом?")
+                # Тихо игнорируем (suppress)
                 return
 
             # Отправляем в общий поток с медиаметаданными; текст – плейсхолдер
@@ -557,7 +585,7 @@ async def main() -> None:
                     if not image_url:
                         raise RuntimeError("empty upload url")
             except Exception:
-                await app.send_message(message.chat.id, "Не получилось обработать фото, пришли текстом?")
+                # Тихо игнорируем (suppress)
                 return
 
             media = {
@@ -571,7 +599,9 @@ async def main() -> None:
             if height:
                 media["height"] = height
 
-            await _process_single(app, shim, message, "[photo]", media, disable_local_typing=True)
+            # caption если есть
+            cap = message.caption or ""
+            await _process_single(app, shim, message, cap, media, disable_local_typing=True, use_buffer=True)
         finally:
             pass
 
