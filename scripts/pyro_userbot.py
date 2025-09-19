@@ -449,6 +449,20 @@ async def main() -> None:
     use_queue = os.getenv("USERBOT_QUEUE_ENABLED", "1").lower() in {"1","true","yes","on"}
     get_logger().info("queue_init", enabled=use_queue)
 
+    # Async migration status check (non-fatal)
+    async def _check_migrations():
+        try:
+            from sqlalchemy import text as _sql_text
+            async with session_scope() as session:
+                res = await session.execute(_sql_text("SELECT version_num FROM alembic_version"))
+                row = res.first()
+                current = row[0] if row else None
+                expected_head = "0013_add_tg_message_id"
+                get_logger().info("migrations_status", current=current, expected=expected_head, up_to_date=(current == expected_head))
+        except Exception as e:
+            get_logger().warning("migrations_status_error", error=str(e))
+    asyncio.create_task(_check_migrations())
+
     async def _enqueue_incoming(message: Message, combined_text: str, media: Optional[Dict] = None, source: str = "live"):
         async with session_scope() as session:
             payload = {

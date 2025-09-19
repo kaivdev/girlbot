@@ -1,6 +1,6 @@
 """add pending input buffer fields
 
-Revision ID: 0011_pending_buffer
+Revision ID: 0011_add_pending_input_buffer
 Revises: 0010_legacy_aggr
 Create Date: 2025-09-19
 
@@ -11,7 +11,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0011_pending_buffer"
+revision = "0011_add_pending_input_buffer"
 down_revision = "0010_legacy_aggr"
 branch_labels = None
 depends_on = None
