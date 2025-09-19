@@ -367,6 +367,7 @@ async def process_user_text(
     media: dict | None = None,
     settings: Settings,
     trace_id: Optional[str] = None,
+    tg_message_id: int | None = None,
 ) -> str:
     """Process incoming user text and send a reply. Returns reply text sent."""
 
@@ -385,7 +386,7 @@ async def process_user_text(
     )
 
     # Save user message
-    session.add(Message(chat_id=chat_id, user_id=user_id, text=trimmed))
+    session.add(Message(chat_id=chat_id, user_id=user_id, text=trimmed, tg_message_id=tg_message_id))
 
     # Update chat state last_user_msg_at
     state = await session.get(ChatState, chat_id)

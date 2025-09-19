@@ -33,6 +33,9 @@ import httpx
 from app.config.settings import get_settings
 from app.db.base import session_scope
 from app.bot.services.reply_flow import process_user_text, buffer_or_process, flush_pending_input, flush_expired_pending_input
+from app.db.task_queue import enqueue_task, lease_tasks, complete, heartbeat
+from app.db.task_watchdog import watchdog_pass
+from app.bot.services.metrics import metrics
 from app.db.models import ProactiveOutbox, AssistantMessage, ChatState, Message as DBMessage, Chat
 from app.utils.time import utcnow
 
@@ -434,6 +437,25 @@ async def main() -> None:
 
         await app.send_message(chat_id, "Контекст очищен: история сброшена, память перезапущена. Можешь продолжать.")
 
+    use_queue = os.getenv("USERBOT_QUEUE_ENABLED", "1").lower() in {"1","true","yes","on"}
+
+    async def _enqueue_incoming(message: Message, combined_text: str, media: Optional[Dict] = None, source: str = "live"):
+        async with session_scope() as session:
+            payload = {
+                "telegram_message_id": message.id,
+                "chat_id": message.chat.id,
+                "chat_type": _chat_type_str(message.chat.type),
+                "user_id": getattr(message.from_user, 'id', None) if message.from_user else None,
+                "username": getattr(message.from_user, 'username', None) if message.from_user else None,
+                "lang": getattr(message.from_user, 'language_code', None) if message.from_user else None,
+                "text": combined_text,
+                "media": media,
+            }
+            # dedup по (chat_id, telegram_message_id) для одиночных сообщений
+            dedup = f"inmsg:{message.chat.id}:{message.id}"
+            await enqueue_task(session, kind="incoming_user_message", payload=payload, priority=100, dedup_key=dedup)
+            metrics.inc("tasks_created_total", labels={"kind": "incoming_user_message", "source": source})
+
     @app.on_message(filters.text & ~filters.me)
     async def handle_text(_: Client, message: Message):
         # Lazy initialize my own user id
@@ -515,7 +537,10 @@ async def main() -> None:
                         )
                         return
             # Если не было активного фото-буфера или он сброшен – обычная обработка (с проверкой на старт нового буфера в _process_single при use_buffer)
-            await _process_single(app, shim, message, message.text or "")
+            if use_queue:
+                await _enqueue_incoming(message, message.text or "", media=None)
+            else:
+                await _process_single(app, shim, message, message.text or "")
             return
 
         # Если во время генерации пришло новое сообщение — по желанию отменяем генерацию
@@ -534,7 +559,16 @@ async def main() -> None:
                 task.cancel()
                 with contextlib.suppress(Exception):
                     await task
-            await flush_buffer(message.chat.id)
+            if use_queue:
+                # Собираем и ставим в очередь как одно сообщение
+                msgs = message_buffers.get(message.chat.id, [])
+                if msgs:
+                    base = msgs[-1]
+                    combined_text = " \n".join(m.text or "" for m in msgs)
+                    message_buffers[message.chat.id] = []
+                    await _enqueue_incoming(base, combined_text, media=None, source="batch")
+            else:
+                await flush_buffer(message.chat.id)
             return
         # Если нет активного таска — запускаем
         if message.chat.id not in buffer_tasks:
@@ -596,7 +630,10 @@ async def main() -> None:
                 "duration": duration,
             }
             # Отключаем локальный typing_loop — его реализует reply_flow через shim.send_chat_action
-            await _process_single(app, shim, message, "[voice_message]", media, disable_local_typing=True)
+            if use_queue:
+                await _enqueue_incoming(message, "[voice_message]", media, source="voice")
+            else:
+                await _process_single(app, shim, message, "[voice_message]", media, disable_local_typing=True)
         finally:
             # Clear in-flight flag
             photo_inflight.pop(message.chat.id, None)
@@ -669,7 +706,11 @@ async def main() -> None:
 
             # caption если есть
             cap = message.caption or ""
-            await _process_single(app, shim, message, cap, media, disable_local_typing=True, use_buffer=True)
+            if use_queue:
+                # В режиме очереди фото + caption сразу как единичное сообщение (агрегация caption уже есть)
+                await _enqueue_incoming(message, cap, media, source="photo")
+            else:
+                await _process_single(app, shim, message, cap, media, disable_local_typing=True, use_buffer=True)
         finally:
             pass
 
@@ -718,6 +759,141 @@ async def main() -> None:
                 pass
 
     asyncio.create_task(outbox_worker())
+
+    async def tasks_worker():
+        if not use_queue:
+            return
+        lease_sec = int(float(os.getenv("TASK_LEASE_SECONDS", "60")))
+        heartbeat_every = max(10, int(float(os.getenv("TASK_HEARTBEAT_SECONDS", "30"))))
+        last_hb: dict[int, float] = {}
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                async with session_scope() as session:
+                    tasks = await lease_tasks(session, kinds=["incoming_user_message"], limit=5, lease_seconds=lease_sec)
+                    if not tasks:
+                        continue
+                    for t in tasks:
+                        payload = t.payload_json
+                        start_monotonic = time.monotonic()
+                        try:
+                            await process_user_text(
+                                shim,
+                                session,
+                                chat_id=payload["chat_id"],
+                                chat_type=payload.get("chat_type", "private"),
+                                user_id=payload.get("user_id"),
+                                username=payload.get("username"),
+                                lang=payload.get("lang"),
+                                text=payload.get("text", ""),
+                                media=payload.get("media"),
+                                settings=settings,
+                                trace_id=None,
+                                tg_message_id=payload.get("telegram_message_id"),
+                            )
+                            await complete(session, t.id, status="done")
+                            metrics.inc("tasks_processed_total", labels={"kind": t.kind, "status": "done"})
+                            metrics.observe("task_processing_seconds", time.monotonic() - start_monotonic, labels={"kind": t.kind})
+                        except Exception as e:
+                            await complete(session, t.id, status="failed", error=str(e)[:4000])
+                            metrics.inc("tasks_processed_total", labels={"kind": t.kind, "status": "failed"})
+                        else:
+                            last_hb.pop(t.id, None)
+                # Heartbeat processed tasks still running (в нашей реализации процесс сразу завершает, heartbeat нужен для длинных задач — оставлено заделом)
+                now_mono = time.monotonic()
+                to_hb: list[int] = []
+                for tid, ts in list(last_hb.items()):
+                    if now_mono - ts >= heartbeat_every:
+                        to_hb.append(tid)
+                        last_hb[tid] = now_mono
+                if to_hb:
+                    async with session_scope() as session:
+                        for tid in to_hb:
+                            await heartbeat(session, tid, lease_seconds=lease_sec)
+            except Exception:
+                pass
+
+    asyncio.create_task(tasks_worker())
+
+    async def watchdog_worker():
+        if not use_queue:
+            return
+        interval = float(os.getenv("TASK_WATCHDOG_INTERVAL", "10"))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                async with session_scope() as session:
+                    stats = await watchdog_pass(session)
+                    if stats.get("returned"):
+                        metrics.inc("tasks_retried_total", value=stats["returned"], labels={"kind": "incoming_user_message"})
+                    if stats.get("failed"):
+                        metrics.inc("tasks_failed_total", value=stats["failed"], labels={"kind": "incoming_user_message"})
+            except Exception:
+                pass
+
+    asyncio.create_task(watchdog_worker())
+
+    async def recovery_worker():
+        if not use_queue:
+            return
+        # Одноразовый прогон после старта
+        recovery_limit = int(float(os.getenv("RECOVERY_HISTORY_LIMIT", "500")))
+        try:
+            me = await app.get_me()
+            my_id = me.id
+        except Exception:
+            return
+        # Соберём чаты где есть state или сообщения (упрощённо: все chat_ids из ChatState)
+        from sqlalchemy import select as _select
+        async with session_scope() as session:
+            rows = (await session.execute(_select(ChatState.chat_id))).all()
+            chat_ids = [r[0] for r in rows]
+        for cid in chat_ids:
+            try:
+                # Найти последний сохранённый tg_message_id
+                async with session_scope() as session:
+                    from sqlalchemy import func as _f
+                    from app.db.models import Message as _Msg
+                    max_row = (await session.execute(_select(_f.max(_Msg.tg_message_id)).where(_Msg.chat_id == cid))).scalar()
+                    last_saved = max_row or 0
+                missing: list[Message] = []
+                count = 0
+                async for h in app.get_chat_history(cid, limit=recovery_limit):
+                    # Pyrogram возвращает от новых к старым. Останавливаемся когда дошли до сохранённого
+                    if h.id <= last_saved:
+                        break
+                    if h.from_user and h.from_user.id == my_id:
+                        continue  # пропускаем собственные ответы
+                    if not (h.text or h.caption):
+                        continue
+                    missing.append(h)
+                    count += 1
+                    if count >= recovery_limit:
+                        break
+                if not missing:
+                    continue
+                metrics.inc("recovery_gap_messages_total", value=len(missing), labels={"kind": "incoming_user_message"})
+                # Добавляем в очередь в порядке возрастания id (старые сначала)
+                for m in sorted(missing, key=lambda x: x.id):
+                    text_val = m.text or m.caption or ""
+                    payload = {
+                        "telegram_message_id": m.id,
+                        "chat_id": cid,
+                        "chat_type": _chat_type_str(m.chat.type if getattr(m, 'chat', None) else None),
+                        "user_id": getattr(m.from_user, 'id', None) if m.from_user else None,
+                        "username": getattr(m.from_user, 'username', None) if m.from_user else None,
+                        "lang": getattr(m.from_user, 'language_code', None) if m.from_user else None,
+                        "text": text_val,
+                        "media": None,
+                    }
+                    async with session_scope() as session:
+                        dedup = f"recovery:{cid}:{m.id}"
+                        await enqueue_task(session, kind="incoming_user_message", payload=payload, priority=90, dedup_key=dedup)
+                        metrics.inc("tasks_created_total", labels={"kind": "incoming_user_message", "source": "recovery"})
+            except Exception:
+                continue
+
+    asyncio.create_task(recovery_worker())
     try:
         await idle()
     finally:
