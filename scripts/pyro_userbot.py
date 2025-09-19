@@ -203,11 +203,15 @@ async def main() -> None:
     batch_max_messages = int(os.getenv("USERBOT_BATCH_MAX_MESSAGES", "5"))    # максимум объединяемых сообщений
     outbox_poll_seconds = float(os.getenv("USERBOT_OUTBOX_POLL_SECONDS", "10"))
     cancel_on_new_msg = os.getenv("USERBOT_CANCEL_ON_NEW_MSG", "1").lower() in {"1","true","yes","on"}
+    # Wait time to attach follow-up text to a photo that's still uploading
+    photo_agg_wait = float(os.getenv("USERBOT_PHOTO_AGGREGATION_WAIT", "3.0"))
 
     # Буфер по chat_id
     message_buffers: Dict[int, List[Message]] = {}
     buffer_tasks: Dict[int, asyncio.Task] = {}
     inflight_tasks: Dict[int, asyncio.Task] = {}
+    # Chats where a photo is being processed (uploading/creating DB pending)
+    photo_inflight: Dict[int, float] = {}
 
     def _start_generation(chat_id: int, base: Message, combined_text: str):
         task = asyncio.create_task(_process_single(app, shim, base, combined_text))
@@ -444,61 +448,46 @@ async def main() -> None:
         # Запоминаем id входящих юзерских сообщений для потенциального reply_to
         dq = recent_user_msgs.setdefault(message.chat.id, deque(maxlen=20))
         dq.append(message.id)
-        # If a photo is currently pending in DB-level buffer, extend it with this text
-        # This ensures: photo + follow-up messages are processed as one, even when local batching is on
-        try:
-            async with session_scope() as session:
-                state = await session.get(ChatState, message.chat.id)
-                pending = getattr(state, 'pending_input_json', None) if state else None
-                pending_is_photo = bool(pending and pending.get('media') and pending['media'].get('origin') == 'photo')
-                if pending_is_photo:
-                    flushed = await flush_expired_pending_input(shim, session, chat_id=message.chat.id, settings=get_settings())
-                    if not flushed:
-                        await buffer_or_process(
-                            shim,
-                            session,
-                            chat_id=message.chat.id,
-                            chat_type=_chat_type_str(message.chat.type),
-                            user_id=(message.from_user.id if message.from_user else None),
-                            username=(message.from_user.username if message.from_user else None),
-                            lang=(getattr(message.from_user, 'language_code', None) if message.from_user else None),
-                            text=message.text or "",
-                            media=None,
-                            settings=get_settings(),
-                            trace_id=None,
-                        )
-                        return
-        except Exception:
-            # Fallback to normal flow if DB pending check fails
-            pass
+        # Helper to append text to a pending photo buffer in DB and avoid double replies
+        async def _try_append_to_pending_photo() -> bool:
+            try:
+                async with session_scope() as session:
+                    state = await session.get(ChatState, message.chat.id)
+                    pending = getattr(state, 'pending_input_json', None) if state else None
+                    pending_is_photo = bool(pending and pending.get('media') and pending['media'].get('origin') == 'photo')
+                    if pending_is_photo:
+                        flushed = await flush_expired_pending_input(shim, session, chat_id=message.chat.id, settings=get_settings())
+                        if not flushed:
+                            await buffer_or_process(
+                                shim,
+                                session,
+                                chat_id=message.chat.id,
+                                chat_type=_chat_type_str(message.chat.type),
+                                user_id=(message.from_user.id if message.from_user else None),
+                                username=(message.from_user.username if message.from_user else None),
+                                lang=(getattr(message.from_user, 'language_code', None) if message.from_user else None),
+                                text=message.text or "",
+                                media=None,
+                                settings=get_settings(),
+                                trace_id=None,
+                            )
+                        return True
+            except Exception:
+                return False
+            return False
 
-        # If a photo is currently pending in DB-level buffer, extend it with this text
-        # This ensures: photo + follow-up messages are processed as one, even when local batching is on
-        try:
-            async with session_scope() as session:
-                state = await session.get(ChatState, message.chat.id)
-                pending = getattr(state, 'pending_input_json', None) if state else None
-                pending_is_photo = bool(pending and pending.get('media') and pending['media'].get('origin') == 'photo')
-                if pending_is_photo:
-                    flushed = await flush_expired_pending_input(shim, session, chat_id=message.chat.id, settings=get_settings())
-                    if not flushed:
-                        await buffer_or_process(
-                            shim,
-                            session,
-                            chat_id=message.chat.id,
-                            chat_type=_chat_type_str(message.chat.type),
-                            user_id=(message.from_user.id if message.from_user else None),
-                            username=(message.from_user.username if message.from_user else None),
-                            lang=(getattr(message.from_user, 'language_code', None) if message.from_user else None),
-                            text=message.text or "",
-                            media=None,
-                            settings=get_settings(),
-                            trace_id=None,
-                        )
-                        return
-        except Exception:
-            # Fallback to normal flow if DB pending check fails
-            pass
+        # Fast path: DB already has a pending photo buffer
+        if await _try_append_to_pending_photo():
+            return
+
+        # Slow path: a photo is in-flight (upload not finished) — wait briefly
+        ts = photo_inflight.get(message.chat.id)
+        if ts is not None and (time.monotonic() - ts) <= max(0.1, photo_agg_wait):
+            deadline = time.monotonic() + photo_agg_wait
+            while time.monotonic() < deadline:
+                if await _try_append_to_pending_photo():
+                    return
+                await asyncio.sleep(0.2)
 
         if not batch_enabled:
             # Попробуем сначала только истекший буфер сбросить. Если буфер активен (фото) и не истёк — просто расширяем его.
@@ -565,6 +554,8 @@ async def main() -> None:
         # Индикация "печатает" пока обрабатываем
         # Скачиваем в память и загружаем на наш backend /upload
         try:
+            # Mark photo processing in-flight for this chat to let following text attach as caption
+            photo_inflight[message.chat.id] = time.monotonic()
             bio: BytesIO = await message.download(in_memory=True)  # type: ignore[assignment]
             # Определяем имя и mime
             mime: str = "application/octet-stream"
@@ -607,7 +598,8 @@ async def main() -> None:
             # Отключаем локальный typing_loop — его реализует reply_flow через shim.send_chat_action
             await _process_single(app, shim, message, "[voice_message]", media, disable_local_typing=True)
         finally:
-            pass
+            # Clear in-flight flag
+            photo_inflight.pop(message.chat.id, None)
 
     @app.on_message(((filters.photo) | (filters.document)) & ~filters.me)
     async def handle_photo(_: Client, message: Message):
