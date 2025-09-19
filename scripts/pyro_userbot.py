@@ -444,6 +444,33 @@ async def main() -> None:
         # Запоминаем id входящих юзерских сообщений для потенциального reply_to
         dq = recent_user_msgs.setdefault(message.chat.id, deque(maxlen=20))
         dq.append(message.id)
+        # If a photo is currently pending in DB-level buffer, extend it with this text
+        # This ensures: photo + follow-up messages are processed as one, even when local batching is on
+        try:
+            async with session_scope() as session:
+                state = await session.get(ChatState, message.chat.id)
+                pending = getattr(state, 'pending_input_json', None) if state else None
+                pending_is_photo = bool(pending and pending.get('media') and pending['media'].get('origin') == 'photo')
+                if pending_is_photo:
+                    flushed = await flush_expired_pending_input(shim, session, chat_id=message.chat.id, settings=get_settings())
+                    if not flushed:
+                        await buffer_or_process(
+                            shim,
+                            session,
+                            chat_id=message.chat.id,
+                            chat_type=_chat_type_str(message.chat.type),
+                            user_id=(message.from_user.id if message.from_user else None),
+                            username=(message.from_user.username if message.from_user else None),
+                            lang=(getattr(message.from_user, 'language_code', None) if message.from_user else None),
+                            text=message.text or "",
+                            media=None,
+                            settings=get_settings(),
+                            trace_id=None,
+                        )
+                        return
+        except Exception:
+            # Fallback to normal flow if DB pending check fails
+            pass
 
         # If a photo is currently pending in DB-level buffer, extend it with this text
         # This ensures: photo + follow-up messages are processed as one, even when local batching is on
