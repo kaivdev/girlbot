@@ -13,7 +13,7 @@ from app.bot.schemas.n8n_io import ChatInfo, Context, MessageIn, N8nRequest
 from app.bot.services.anti_spam import is_allowed, remaining_wait_seconds
 from app.bot.services.history import fetch_recent_history
 from app.bot.services.metrics import metrics
-from app.bot.services.n8n_client import call_n8n
+from app.bot.services.n8n_client import call_n8n, N8NServerError, N8NClientError
 from app.bot.services.logging import get_logger
 from app.config.settings import Settings
 from app.db.models import AssistantMessage, Chat, ChatState, Event, Message, User
@@ -573,20 +573,30 @@ async def process_user_text(
     logger = get_logger().bind(chat_id=chat_id, user_id=user_id, intent="reply", trace_id=trace_id)
     try:
         n8n_resp = await call_n8n(req, trace_id=trace_id)
-    except Exception as e:
-        logger.error("n8n_call_failed", exc_info=True, error=str(e))
-        session.add(Event(kind="n8n_error", chat_id=chat_id, user_id=user_id, payload_json={"intent": "reply"}))
-        metrics.inc("n8n_errors_total", labels={"intent": "reply"})
-        # Если бот не в режиме подавления — отправляем уведомление
+    except N8NServerError as e:
+        # Пробрасываем серверную ошибку дальше (для ретраев в воркере)
+        logger.error("n8n_call_failed_5xx", exc_info=True, error=str(e))
+        session.add(Event(kind="n8n_error_5xx", chat_id=chat_id, user_id=user_id, payload_json={"intent": "reply", "status": e.status}))
+        metrics.inc("n8n_errors_total", labels={"intent": "reply", "class": "5xx"})
+        raise
+    except N8NClientError as e:
+        # 4xx — считаем окончательной ошибкой (не ретраим), можно подавить
+        logger.warning("n8n_call_failed_4xx", error=str(e))
+        session.add(Event(kind="n8n_error_4xx", chat_id=chat_id, user_id=user_id, payload_json={"intent": "reply", "status": e.status}))
+        metrics.inc("n8n_errors_total", labels={"intent": "reply", "class": "4xx"})
         if not getattr(bot, "suppress_errors", False):
-            msg = "Сервис занят, попробуйте позже"
+            msg = "Некорректный запрос"
             try:
                 await bot.send_message(chat_id, msg)
             except Exception:
                 pass
             return msg
-        # suppress: просто молча вернуть технический маркер
         return "(n8n_error_suppressed)"
+    except Exception as e:
+        logger.error("n8n_call_failed_other", exc_info=True, error=str(e))
+        session.add(Event(kind="n8n_error_other", chat_id=chat_id, user_id=user_id, payload_json={"intent": "reply"}))
+        metrics.inc("n8n_errors_total", labels={"intent": "reply", "class": "other"})
+        raise
 
     # Если n8n пометил сообщение как оскорбительное — сразу уходим в «сон» на указанный срок
     try:

@@ -30,6 +30,20 @@ async def _client() -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
+class N8NServerError(Exception):
+    def __init__(self, status: int, body_preview: str):
+        self.status = status
+        self.body_preview = body_preview
+        super().__init__(f"n8n 5xx status={status} preview={body_preview[:120]}")
+
+
+class N8NClientError(Exception):
+    def __init__(self, status: int, body_preview: str):
+        self.status = status
+        self.body_preview = body_preview
+        super().__init__(f"n8n 4xx status={status} preview={body_preview[:120]}")
+
+
 async def call_n8n(req: N8nRequest, *, trace_id: str | None = None) -> N8nResponse:
     """POST the request to n8n and return parsed response.
 
@@ -52,7 +66,15 @@ async def call_n8n(req: N8nRequest, *, trace_id: str | None = None) -> N8nRespon
         async with _client() as client:
             logger.info("n8n_request_start", url=str(settings.n8n_webhook_url))
             resp = await client.post(str(settings.n8n_webhook_url), json=payload, headers=headers)
-            resp.raise_for_status()
+            status = resp.status_code
+            if status >= 400:
+                preview = resp.text[:500]
+                if status >= 500:
+                    logger.error("n8n_5xx", status=status, preview=preview)
+                    raise N8NServerError(status, preview)
+                else:
+                    logger.warning("n8n_4xx", status=status, preview=preview)
+                    raise N8NClientError(status, preview)
 
             # Guard against empty bodies and non-JSON replies
             content_type = resp.headers.get("content-type", "")

@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import os
 import random
+import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import Optional, Dict, List
@@ -33,9 +34,10 @@ import httpx
 from app.config.settings import get_settings
 from app.db.base import session_scope
 from app.bot.services.reply_flow import process_user_text, buffer_or_process, flush_pending_input, flush_expired_pending_input
-from app.db.task_queue import enqueue_task, lease_tasks, complete, heartbeat
+from app.db.task_queue import enqueue_task, lease_tasks, complete, heartbeat, return_to_pending
 from app.db.task_watchdog import watchdog_pass
 from app.bot.services.metrics import metrics
+from app.bot.services.logging import get_logger
 from app.db.models import ProactiveOutbox, AssistantMessage, ChatState, Message as DBMessage, Chat
 from app.utils.time import utcnow
 
@@ -259,6 +261,13 @@ async def main() -> None:
         buffer_tasks.pop(chat_id, None)
 
     async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False, use_buffer: bool = False):
+        try:
+            # Вся логика внутри; CancelledError подавляется тихо
+            return await _process_single_inner(app, shim, message, text, media, disable_local_typing=disable_local_typing, use_buffer=use_buffer)
+        except asyncio.CancelledError:
+            return
+
+    async def _process_single_inner(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False, use_buffer: bool = False):
         # Lazy initialize my own user id
         if not my_id_box:
             me = await app.get_me()
@@ -450,11 +459,14 @@ async def main() -> None:
                 "lang": getattr(message.from_user, 'language_code', None) if message.from_user else None,
                 "text": combined_text,
                 "media": media,
+                "trace_id": str(uuid.uuid4()),
+                "source": source,
             }
             # dedup по (chat_id, telegram_message_id) для одиночных сообщений
             dedup = f"inmsg:{message.chat.id}:{message.id}"
             await enqueue_task(session, kind="incoming_user_message", payload=payload, priority=100, dedup_key=dedup)
             metrics.inc("tasks_created_total", labels={"kind": "incoming_user_message", "source": source})
+            get_logger().info("task_enqueue", kind="incoming_user_message", chat_id=message.chat.id, tg_message_id=message.id, source=source, trace_id=payload["trace_id"])
 
     @app.on_message(filters.text & ~filters.me)
     async def handle_text(_: Client, message: Message):
@@ -773,9 +785,12 @@ async def main() -> None:
                     tasks = await lease_tasks(session, kinds=["incoming_user_message"], limit=5, lease_seconds=lease_sec)
                     if not tasks:
                         continue
+                    get_logger().info("task_lease_batch", count=len(tasks))
                     for t in tasks:
                         payload = t.payload_json
                         start_monotonic = time.monotonic()
+                        logger = get_logger().bind(task_id=t.id, attempt=t.attempts, chat_id=payload.get("chat_id"), trace_id=payload.get("trace_id"))
+                        logger.info("task_start", kind=t.kind)
                         try:
                             await process_user_text(
                                 shim,
@@ -794,9 +809,19 @@ async def main() -> None:
                             await complete(session, t.id, status="done")
                             metrics.inc("tasks_processed_total", labels={"kind": t.kind, "status": "done"})
                             metrics.observe("task_processing_seconds", time.monotonic() - start_monotonic, labels={"kind": t.kind})
+                            logger.info("task_done", kind=t.kind)
                         except Exception as e:
-                            await complete(session, t.id, status="failed", error=str(e)[:4000])
-                            metrics.inc("tasks_processed_total", labels={"kind": t.kind, "status": "failed"})
+                            # Классификация серверных ошибок n8n по тексту (исключение прокинуто из N8NServerError)
+                            is_5xx = "n8n 5xx" in str(e)
+                            if is_5xx and t.attempts < 5:
+                                # Возвращаем задачу в pending с простым backoff через sleep перед повторным лизингом
+                                await return_to_pending(session, [t.id])
+                                metrics.inc("tasks_retried_total", labels={"kind": t.kind})
+                                logger.warning("task_requeue", reason="n8n_5xx", attempts=t.attempts)
+                            else:
+                                await complete(session, t.id, status="failed", error=str(e)[:4000])
+                                metrics.inc("tasks_processed_total", labels={"kind": t.kind, "status": "failed"})
+                                logger.error("task_fail", error_class="n8n_5xx" if is_5xx else "exception", error=str(e))
                         else:
                             last_hb.pop(t.id, None)
                 # Heartbeat processed tasks still running (в нашей реализации процесс сразу завершает, heartbeat нужен для длинных задач — оставлено заделом)
@@ -828,6 +853,8 @@ async def main() -> None:
                         metrics.inc("tasks_retried_total", value=stats["returned"], labels={"kind": "incoming_user_message"})
                     if stats.get("failed"):
                         metrics.inc("tasks_failed_total", value=stats["failed"], labels={"kind": "incoming_user_message"})
+                    if stats.get("returned") or stats.get("failed"):
+                        get_logger().info("watchdog_pass", returned=stats.get("returned",0), failed=stats.get("failed",0))
             except Exception:
                 pass
 
