@@ -570,7 +570,26 @@ async def main() -> None:
             if not str(message.document.mime_type).startswith("image/"):
                 return
 
-        # Скачиваем изображение (Pyrogram сам возьмёт лучший размер для photo)
+        # caption до начала долгих операций
+        initial_caption = message.caption or ""
+        # 1) Сразу стартуем буфер (без media), чтобы следующий текст попал внутрь пока идёт загрузка
+        async with session_scope() as pre_sess:
+            from app.bot.services.reply_flow import buffer_or_process
+            await buffer_or_process(
+                shim,
+                pre_sess,
+                chat_id=message.chat.id,
+                chat_type=_chat_type_str(message.chat.type),
+                user_id=(message.from_user.id if message.from_user else None),
+                username=(message.from_user.username if message.from_user else None),
+                lang=(getattr(message.from_user, 'language_code', None) if message.from_user else None),
+                text=initial_caption,
+                media=None,  # media добавим позже
+                settings=settings,
+                trace_id=None,
+            )
+
+        # 2) Скачиваем изображение (Pyrogram сам возьмёт лучший размер для photo)
         try:
             bio: BytesIO = await message.download(in_memory=True)  # type: ignore[assignment]
             mime: str = "image/jpeg"
@@ -620,9 +639,16 @@ async def main() -> None:
             if height:
                 media["height"] = height
 
-            # caption если есть
-            cap = message.caption or ""
-            await _process_single(app, shim, message, cap, media, disable_local_typing=True, use_buffer=True)
+            # 3) Обновляем уже существующий буфер добавляя media (если он ещё активен)
+            async with session_scope() as upd_sess:
+                state = await upd_sess.get(ChatState, message.chat.id)
+                if state and getattr(state, 'pending_input_json', None):
+                    pending = state.pending_input_json
+                    if pending and not pending.get('media'):
+                        pending['media'] = media
+                        state.pending_input_json = pending
+                        state.pending_updated_at = utcnow()
+                # если буфер уже успел флешнуться (например по таймеру) — ничего не делаем
         finally:
             pass
 
