@@ -55,6 +55,22 @@ class PyroBotShim:
             return await self.client.send_message(chat_id, text, reply_to_message_id=reply_to_id)
         return await self.client.send_message(chat_id, text)
 
+    async def send_chat_action(self, chat_id: int, action: str):  # emulate aiogram Bot interface
+        # Map aiogram-like action strings to Pyrogram ChatAction enums
+        mapping = {
+            "typing": ChatAction.TYPING,
+            "upload_photo": getattr(ChatAction, "UPLOAD_PHOTO", ChatAction.TYPING),
+            "record_voice": getattr(ChatAction, "RECORD_AUDIO", ChatAction.TYPING),
+            "record_audio": getattr(ChatAction, "RECORD_AUDIO", ChatAction.TYPING),
+        }
+        enum_val = mapping.get(action.lower(), ChatAction.TYPING)
+        try:
+            await self.client.send_chat_action(chat_id, enum_val)
+        except Exception:
+            # Fallback to typing silently
+            with contextlib.suppress(Exception):
+                await self.client.send_chat_action(chat_id, ChatAction.TYPING)
+
 
 async def typing_loop(client: Client, chat_id: int, interval: float):
     """Continuously send typing action until cancelled."""
@@ -231,7 +247,7 @@ async def main() -> None:
         await flush_buffer(chat_id)
         buffer_tasks.pop(chat_id, None)
 
-    async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None):
+    async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False):
         # Lazy initialize my own user id
         if not my_id_box:
             me = await app.get_me()
@@ -286,7 +302,7 @@ async def main() -> None:
 
         start_t = time.monotonic()
         typing_task: Optional[asyncio.Task] = None
-        if typing_enabled:
+        if typing_enabled and not disable_local_typing:
             typing_task = asyncio.create_task(typing_loop(app, chat.id, typing_interval))
         try:
             cancelled = False
@@ -443,9 +459,8 @@ async def main() -> None:
             return
 
         # Индикация "печатает" пока обрабатываем
-        typing_task = asyncio.create_task(typing_loop(app, message.chat.id, 4.0))
+        # Скачиваем в память и загружаем на наш backend /upload
         try:
-            # Скачиваем в память и загружаем на наш backend /upload
             bio: BytesIO = await message.download(in_memory=True)  # type: ignore[assignment]
             # Определяем имя и mime
             mime: str = "application/octet-stream"
@@ -485,12 +500,10 @@ async def main() -> None:
                 "mime_type": mime,
                 "duration": duration,
             }
-            await _process_single(app, shim, message, "[voice_message]", media)
+            # Отключаем локальный typing_loop — его реализует reply_flow через shim.send_chat_action
+            await _process_single(app, shim, message, "[voice_message]", media, disable_local_typing=True)
         finally:
-            if typing_task and not typing_task.cancelled():
-                typing_task.cancel()
-                with contextlib.suppress(Exception):
-                    await typing_task
+            pass
 
     @app.on_message(((filters.photo) | (filters.document)) & ~filters.me)
     async def handle_photo(_: Client, message: Message):
@@ -508,9 +521,8 @@ async def main() -> None:
             if not str(message.document.mime_type).startswith("image/"):
                 return
 
-        typing_task = asyncio.create_task(typing_loop(app, message.chat.id, 4.0))
+        # Скачиваем изображение (Pyrogram сам возьмёт лучший размер для photo)
         try:
-            # Скачиваем изображение (Pyrogram сам возьмёт лучший размер для photo)
             bio: BytesIO = await message.download(in_memory=True)  # type: ignore[assignment]
             mime: str = "image/jpeg"
             filename: str = "photo.jpg"
@@ -559,12 +571,9 @@ async def main() -> None:
             if height:
                 media["height"] = height
 
-            await _process_single(app, shim, message, "[photo]", media)
+            await _process_single(app, shim, message, "[photo]", media, disable_local_typing=True)
         finally:
-            if typing_task and not typing_task.cancelled():
-                typing_task.cancel()
-                with contextlib.suppress(Exception):
-                    await typing_task
+            pass
 
     print("[userbot] starting... press Ctrl+C to stop")
     await app.start()

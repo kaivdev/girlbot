@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Optional
+import os
 
 from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +21,240 @@ from app.utils.time import future_with_jitter, utcnow
 from datetime import timedelta
 import random
 import re
+from sqlalchemy import select
+from app.db.base import session_scope
+
+# Параметры debounce (могут быть вынесены в настройки позже)
+DEBOUNCE_INITIAL_SECONDS = 10  # первое окно после первого входящего
+DEBOUNCE_EXTENSION_SECONDS = 6  # продление окна после каждого нового фрагмента
+DEBOUNCE_ABSOLUTE_MAX_SECONDS = 30  # страховка от бесконечного удержания
+
+# Реестр фоновых задач авто-флаша буфера: chat_id -> Task
+_buffer_flush_tasks: dict[int, asyncio.Task] = {}
+
+def _cancel_existing_flush(chat_id: int):
+    t = _buffer_flush_tasks.get(chat_id)
+    if t and not t.done():
+        t.cancel()
+    _buffer_flush_tasks.pop(chat_id, None)
+
+def _schedule_flush_task(bot: Bot, chat_id: int, deadline_at_iso: str | None, settings: Settings, trace_id: str | None):
+    from datetime import datetime as _dt
+    if not deadline_at_iso:
+        return
+    try:
+        deadline = _dt.fromisoformat(deadline_at_iso)
+    except Exception:
+        return
+    wait = (deadline - utcnow()).total_seconds()
+    if wait < 0:
+        wait = 0.05
+
+    async def _task():  # pragma: no cover (фоновая логика)
+        try:
+            await asyncio.sleep(wait)
+            async with session_scope() as sess:
+                state = await sess.get(ChatState, chat_id)
+                if not state or not state.pending_input_json:
+                    return
+                pj = state.pending_input_json
+                # Проверим что сроки действительно истекли
+                da = pj.get('deadline_at')
+                aa = pj.get('absolute_deadline_at')
+                def _parse(s):
+                    try:
+                        return _dt.fromisoformat(s) if s else None
+                    except Exception:
+                        return None
+                da_dt = _parse(da)
+                aa_dt = _parse(aa)
+                now_local = utcnow()
+                if (da_dt and now_local >= da_dt) or (aa_dt and now_local >= aa_dt):
+                    # Выполняем flush
+                    try:
+                        await flush_pending_input(bot, sess, chat_id=chat_id, settings=settings, trace_id=trace_id)
+                    except Exception:
+                        pass
+        finally:
+            # Очистим запись о задаче если она наша
+            existing = _buffer_flush_tasks.get(chat_id)
+            if existing is asyncio.current_task():
+                _buffer_flush_tasks.pop(chat_id, None)
+
+    _cancel_existing_flush(chat_id)
+    _buffer_flush_tasks[chat_id] = asyncio.create_task(_task())
+
+async def flush_pending_input(
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    settings: Settings,
+    trace_id: str | None = None,
+) -> Optional[str]:
+    state = await session.get(ChatState, chat_id)
+    if not state or not getattr(state, 'pending_input_json', None):
+        return None
+    payload = state.pending_input_json or {}
+    text = (payload.get('text') or '').strip()
+    media = payload.get('media') or None
+    user_id = payload.get('user_id')
+    username = payload.get('username')
+    lang = payload.get('lang')
+    chat_type = payload.get('chat_type') or 'private'
+    # Очистим буфер перед фактической отправкой (чтобы повторные события не дублировались)
+    state.pending_input_json = None
+    state.pending_started_at = None
+    state.pending_updated_at = None
+    # Сохранение и обработка как обычного текста
+    return await process_user_text(
+        bot,
+        session,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        user_id=user_id,
+        username=username,
+        lang=lang,
+        text=text,
+        media=media,
+        settings=settings,
+        trace_id=trace_id,
+    )
+
+
+async def buffer_or_process(
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    chat_type: str,
+    user_id: Optional[int],
+    username: Optional[str],
+    lang: Optional[str],
+    text: str,
+    media: dict | None,
+    settings: Settings,
+    trace_id: Optional[str] = None,
+) -> str:
+    """Агрегирует серию сообщений пользователя (фото + последующие тексты) в одно.
+
+    Правила:
+    - Если нет активного буфера: создаём (pending_input_json) и ждём до DEBOUNCE_INITIAL_SECONDS.
+    - Каждое новое сообщение в окне продлевает дедлайн на DEBOUNCE_EXTENSION_SECONDS.
+    - Абсолютный максимум удержания: DEBOUNCE_ABSOLUTE_MAX_SECONDS.
+    - Если приходит новое фото, а в буфере уже есть фото — сначала флэш текущего буфера, потом начинаем новый.
+    - Сохраняем первое фото (media.origin=='photo') как media; последующие текстовые добавляем в aggregated text.
+    - Для фото без caption text может быть пустым; caption добавляем как часть текста.
+    - Не вставляем placeholder [photo] в сам текст; media несёт origin=photo.
+    """
+    now = utcnow()
+    state = await session.get(ChatState, chat_id)
+    if state is None:
+        # ensure_entities внутри process_user_text создаст state, но нам нужен сразу
+        await ensure_entities(
+            session,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+            username=username,
+            lang=lang,
+            settings=settings,
+        )
+        state = await session.get(ChatState, chat_id)
+
+    existing = getattr(state, 'pending_input_json', None)
+    # Helper to actually start new buffer
+    def _start_buffer():
+        state.pending_input_json = {
+            'text': text.strip(),
+            'media': media if media else None,
+            'started_at': now.isoformat(),
+            'deadline_at': (now + timedelta(seconds=DEBOUNCE_INITIAL_SECONDS)).isoformat(),
+            'absolute_deadline_at': (now + timedelta(seconds=DEBOUNCE_ABSOLUTE_MAX_SECONDS)).isoformat(),
+            'user_id': user_id,
+            'username': username,
+            'lang': lang,
+            'chat_type': chat_type,
+        }
+        state.pending_started_at = now
+        state.pending_updated_at = now
+        return "(buffer_started)"
+
+    # Если нет существующего буфера — стартуем
+    if not existing:
+        marker = _start_buffer()
+        # Планируем авто-flush по initial дедлайну
+        new_state = state.pending_input_json or {}
+        _schedule_flush_task(bot, chat_id, new_state.get('deadline_at'), settings, trace_id)
+        return marker
+
+    # Есть буфер: проверим абсолютный дедлайн
+    from datetime import datetime as _dt
+    def _parse_ts(s: str | None):
+        if not s:
+            return None
+        try:
+            return _dt.fromisoformat(s)
+        except Exception:
+            return None
+    deadline_at = _parse_ts(existing.get('deadline_at'))
+    absolute_deadline_at = _parse_ts(existing.get('absolute_deadline_at'))
+    started_at = _parse_ts(existing.get('started_at'))
+    existing_media = existing.get('media')
+
+    need_flush_before = False
+    # Новое фото при уже существующем фото в буфере -> flush потом новая серия
+    if media and media.get('origin') == 'photo' and existing_media and existing_media.get('origin') == 'photo':
+        need_flush_before = True
+
+    if need_flush_before:
+        await flush_pending_input(bot, session, chat_id=chat_id, settings=settings, trace_id=trace_id)
+        marker = _start_buffer()
+        new_state = state.pending_input_json or {}
+        _schedule_flush_task(bot, chat_id, new_state.get('deadline_at'), settings, trace_id)
+        return marker
+
+    # Проверим сроки: если абсолютный дедлайн истёк — flush и начнём новый буфер
+    if absolute_deadline_at and now >= absolute_deadline_at:
+        await flush_pending_input(bot, session, chat_id=chat_id, settings=settings, trace_id=trace_id)
+        marker = _start_buffer()
+        new_state = state.pending_input_json or {}
+        _schedule_flush_task(bot, chat_id, new_state.get('deadline_at'), settings, trace_id)
+        return marker
+
+    # Если обычный дедлайн истёк — flush текущий и новый буфер
+    if deadline_at and now >= deadline_at:
+        await flush_pending_input(bot, session, chat_id=chat_id, settings=settings, trace_id=trace_id)
+        marker = _start_buffer()
+        new_state = state.pending_input_json or {}
+        _schedule_flush_task(bot, chat_id, new_state.get('deadline_at'), settings, trace_id)
+        return marker
+
+    # Продлеваем дедлайн
+    new_deadline = now + timedelta(seconds=DEBOUNCE_EXTENSION_SECONDS)
+    if absolute_deadline_at and new_deadline > absolute_deadline_at:
+        new_deadline = absolute_deadline_at
+
+    # Обновляем текст (склеиваем)
+    existing_text = existing.get('text') or ''
+    new_text_part = text.strip()
+    if new_text_part:
+        if existing_text:
+            existing_text = f"{existing_text} {new_text_part}".strip()
+        else:
+            existing_text = new_text_part
+    existing['text'] = existing_text
+    # Сохраняем фото только если в буфере ещё не было и новое media=photo
+    if not existing_media and media and media.get('origin') == 'photo':
+        existing['media'] = media
+    # Обновим дедлайны
+    existing['deadline_at'] = new_deadline.isoformat()
+    state.pending_input_json = existing
+    state.pending_updated_at = now
+    # Перепланируем flush по новому дедлайну
+    updated_state = state.pending_input_json or {}
+    _schedule_flush_task(bot, chat_id, updated_state.get('deadline_at'), settings, trace_id)
+    return "(buffer_extended)"
 
 GOODNIGHT_KEYWORDS = [
     "споки", "спокойной", "доброй ночи", "споки ноки", "споки-ноки", "на ночь", "пора спать", "иду спать"
@@ -393,14 +628,83 @@ async def process_user_text(
 
     metrics.observe("reply_delay_seconds", delay_seconds)
 
+    # --- Специализированные задержки для медиа ---
+    media_origin = None
+    try:
+        if isinstance(media, dict):
+            media_origin = media.get("origin")
+    except Exception:
+        media_origin = None
+
+    # Применяем override только если не enforced_long (приорит.)
+    if media_origin == "photo" and enforced_long_delay_seconds is None:
+        # Фото: фиксированный небольшой диапазон 5-6 секунд
+        try:
+            photo_min = int(os.getenv("PHOTO_REPLY_DELAY_MIN", "5"))
+            photo_max = int(os.getenv("PHOTO_REPLY_DELAY_MAX", "6"))
+            if photo_max < photo_min:
+                photo_max = photo_min
+        except Exception:
+            photo_min, photo_max = 5, 6
+        delay_seconds = random.uniform(photo_min, photo_max)
+        delay_kind = "photo"
+    elif media_origin in {"voice", "audio"} and enforced_long_delay_seconds is None:
+        # Голос: длительность + 2-4с (конфигурируемо через ENV)
+        import os as _os
+        try:
+            extra_min = float(_os.getenv("VOICE_DELAY_EXTRA_MIN", "2"))
+            extra_max = float(_os.getenv("VOICE_DELAY_EXTRA_MAX", "4"))
+            if extra_max < extra_min:
+                extra_max = extra_min
+        except Exception:
+            extra_min, extra_max = 2.0, 4.0
+        duration = 0.0
+        try:
+            if isinstance(media, dict):
+                d = media.get("duration")
+                if isinstance(d, (int, float)):
+                    duration = float(d)
+        except Exception:
+            duration = 0.0
+        duration = max(1.5, min(duration, 120.0))  # кламп
+        delay_seconds = duration + random.uniform(extra_min, extra_max)
+        delay_kind = "voice"
+
+    metrics.observe("reply_delay_seconds", delay_seconds, labels={"adjusted": "1" if media_origin else "0"})
+
+    async def _typing_loop(action: str, total: float):  # pragma: no cover (сетевой I/O)
+        # Telegram скрывает action через ~5с, поэтому обновляем каждые ~4с
+        try:
+            end = utcnow() + timedelta(seconds=total)
+            while utcnow() < end:
+                try:
+                    await bot.send_chat_action(chat_id, action)
+                except Exception:
+                    return
+                await asyncio.sleep(4)
+        except Exception:
+            return
+
     if delay_seconds <= 0:
         pass  # immediate
     elif delay_seconds <= 30:
-        # Короткая задержка — ждём inline
+        # Короткая задержка — имитируем activity + ждём inline
+        typing_action = "typing"
+        if media_origin == "photo":
+            typing_action = "upload_photo"  # можно сменить позже на просто typing
+        elif media_origin in {"voice", "audio"}:
+            typing_action = "record_voice"
+        asyncio.create_task(_typing_loop(typing_action, delay_seconds))
         await asyncio.sleep(delay_seconds)
     else:
         # Длинная задержка: отпускаем функцию сразу, создаём фоновую задачу
         async def _delayed_send(text_to_send: str, ds: float, chat_id_local: int, meta_local: dict, dkind: str):
+            typing_action = "typing"
+            if media_origin == "photo":
+                typing_action = "upload_photo"
+            elif media_origin in {"voice", "audio"}:
+                typing_action = "record_voice"
+            asyncio.create_task(_typing_loop(typing_action, ds))
             await asyncio.sleep(ds)
             try:
                 await bot.send_message(chat_id_local, text_to_send)

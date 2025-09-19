@@ -96,6 +96,11 @@ class ChatState(Base):
     blocked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     warnings_given: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # Буфер входящих сообщений (агрегация серии фото+текст)
+    pending_input_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    pending_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    pending_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     chat: Mapped[Chat] = relationship(back_populates="state")
 
 

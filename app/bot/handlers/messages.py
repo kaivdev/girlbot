@@ -5,7 +5,7 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.types import Message
 
-from app.bot.services.reply_flow import process_user_text
+from app.bot.services.reply_flow import process_user_text, buffer_or_process, flush_pending_input
 from app.bot.services.media_upload import get_file_bytes, upload_bytes
 from app.config.settings import get_settings
 from app.db.base import session_scope
@@ -25,7 +25,9 @@ async def on_text(message: Message) -> None:
     text = message.text or ""
 
     async with session_scope() as session:
-        await process_user_text(
+        # Попытка авто-флаша просроченного буфера перед обработкой нового текста
+        await flush_pending_input(message.bot, session, chat_id=chat.id, settings=settings)
+        await buffer_or_process(
             message.bot,
             session,
             chat_id=chat.id,
@@ -34,6 +36,7 @@ async def on_text(message: Message) -> None:
             username=(user.username if user else None),
             lang=(user.language_code if user else None),
             text=text,
+            media=None,
             settings=settings,
             trace_id=None,
         )
@@ -68,8 +71,11 @@ async def on_voice(message: Message) -> None:
     # Placeholder text; transcription will replace it in n8n pipeline
     placeholder = "[voice_message]"
 
+    caption = message.caption or message.caption_html or ""
+    # Для фото текст буфера = caption (без placeholder)
     async with session_scope() as session:
-        await process_user_text(
+        await flush_pending_input(message.bot, session, chat_id=chat.id, settings=settings)
+        await buffer_or_process(
             message.bot,
             session,
             chat_id=chat.id,
@@ -77,7 +83,7 @@ async def on_voice(message: Message) -> None:
             user_id=(user.id if user else None),
             username=(user.username if user else None),
             lang=(user.language_code if user else None),
-            text=placeholder,
+            text=caption,
             media=media,
             settings=settings,
             trace_id=None,
@@ -139,8 +145,10 @@ async def on_photo(message: Message) -> None:
 
     placeholder = "[photo]"
 
+    caption = message.caption or message.caption_html or ""
     async with session_scope() as session:
-        await process_user_text(
+        await flush_pending_input(message.bot, session, chat_id=chat.id, settings=settings)
+        await buffer_or_process(
             message.bot,
             session,
             chat_id=chat.id,
@@ -148,7 +156,7 @@ async def on_photo(message: Message) -> None:
             user_id=(user.id if user else None),
             username=(user.username if user else None),
             lang=(user.language_code if user else None),
-            text=placeholder,
+            text=caption,
             media=media,
             settings=settings,
             trace_id=None,
