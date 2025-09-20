@@ -279,13 +279,18 @@ async def main() -> None:
         buffer_tasks.pop(chat_id, None)
 
     async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False, use_buffer: bool = False):
+        trace_id = str(uuid.uuid4())
         try:
-            # Вся логика внутри; CancelledError подавляется тихо
-            return await _process_single_inner(app, shim, message, text, media, disable_local_typing=disable_local_typing, use_buffer=use_buffer)
+            return await _process_single_inner(app, shim, message, text, media, disable_local_typing=disable_local_typing, use_buffer=use_buffer, trace_id=trace_id)
         except asyncio.CancelledError:
+            get_logger().info("userbot_task_cancelled", chat_id=message.chat.id, trace_id=trace_id)
+            return
+        except Exception as e:
+            get_logger().error("userbot_task_failed", chat_id=message.chat.id, error=str(e), trace_id=trace_id)
+            # fallback можно добавить по желанию
             return
 
-    async def _process_single_inner(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False, use_buffer: bool = False):
+    async def _process_single_inner(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False, use_buffer: bool = False, trace_id: Optional[str] = None):
         # Lazy initialize my own user id
         if not my_id_box:
             me = await app.get_me()
@@ -360,7 +365,7 @@ async def main() -> None:
                             text=text,
                             media=media,
                             settings=settings,
-                            trace_id=None,
+                            trace_id=trace_id,
                         )
                         # Если просто буфер — ответа сейчас не будет
                         if marker in {"(buffer_started)", "(buffer_extended)"}:
@@ -377,7 +382,7 @@ async def main() -> None:
                             text=text,
                             media=media,
                             settings=settings,
-                            trace_id=None,
+                            trace_id=trace_id,
                         )
                 except asyncio.CancelledError:
                     cancelled = True
@@ -640,7 +645,7 @@ async def main() -> None:
                             reason="first_cancel",
                             recent_cancels=len(cancel_events[message.chat.id]),
                         )
-
+                else:
                     get_logger().info(
                         "buffer_cancel_skipped",
                         chat_id=message.chat.id,
@@ -668,6 +673,13 @@ async def main() -> None:
                 if msgs:
                     base = msgs[-1]
                     combined_text = " \n".join(m.text or "" for m in msgs)
+                    get_logger().info(
+                        "buffer_flush",
+                        chat_id=message.chat.id,
+                        count=len(msgs),
+                        reason="max_messages",
+                        total_chars=len(combined_text),
+                    )
                     message_buffers[message.chat.id] = []
                     await _enqueue_incoming(base, combined_text, media=None, source="batch")
             else:
