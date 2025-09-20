@@ -88,7 +88,17 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
         if getattr(state, "sleep_until", None) and state.sleep_until > now_utc:
             continue
         # вычисляем локальное время (пока через offset, иначе UTC)
-        offset_min = state.timezone_offset_minutes or 0
+        if state.timezone_offset_minutes is None:
+            offset_min = getattr(settings, "default_timezone_offset_minutes", 0)
+            # Логируем только если не ноль и нет индивидуального оффсета
+            if offset_min:
+                logger.debug(
+                    "proactive_timezone_fallback",
+                    chat_id=state.chat_id,
+                    applied_offset=offset_min,
+                )
+        else:
+            offset_min = state.timezone_offset_minutes
         local_now = now_utc + timedelta(minutes=offset_min)
         minute_of_day = local_now.hour * 60 + local_now.minute
 

@@ -83,7 +83,9 @@ class ChatState(Base):
     last_goodnight_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_reengage_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # Индивидуальный таймзон оффсет в минутах (опционально)
-    timezone_offset_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    timezone_offset_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=180, server_default="180"
+    )
     # Режим сна: до какого момента игнорировать входящие сообщения (UTC)
     sleep_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     proactive_via_userbot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

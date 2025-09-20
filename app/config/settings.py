@@ -100,6 +100,8 @@ class Settings(BaseSettings):
     proactive_quiet_window: str | None = None    # e.g. "00:30-07:00"
     reengage_min_hours: int = 6
     reengage_cooldown_hours: int = 12
+    # Global default timezone offset (minutes from UTC). Moscow = +180
+    default_timezone_offset_minutes: int = 180
 
     # Limits
     max_user_text_len: int = 4000
@@ -154,6 +156,14 @@ class Settings(BaseSettings):
         self.moderation.abuse_enabled = _get_bool_env("ABUSE_ENABLED", self.moderation.abuse_enabled)
         self.moderation.abuse_mute_hours = _get_int_env("ABUSE_MUTE_HOURS", self.moderation.abuse_mute_hours)
         # Nothing else: окна читаем как строки, числа уже есть
+        # Default timezone offset fallback (supports two env var names)
+        try:
+            self.default_timezone_offset_minutes = _get_int_env(
+                "DEFAULT_TIMEZONE_OFFSET_MINUTES",
+                _get_int_env("DEFAULT_TZ_OFFSET_MINUTES", self.default_timezone_offset_minutes),
+            )
+        except Exception:
+            pass
 
 
 @lru_cache(maxsize=1)
