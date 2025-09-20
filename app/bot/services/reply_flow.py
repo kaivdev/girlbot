@@ -660,14 +660,29 @@ async def process_user_text(
                     mh = flags.get("mute_hours")
                     mute_hours = mh if isinstance(mh, (int, float)) else None
         if abuse_flag is True:
+            # Записываем событие, но НЕ ставим немедленный mute (frequency-only режим)
+            session.add(
+                Event(
+                    kind="abuse_detected",
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    payload_json={
+                        "severity": getattr(meta_obj, "severity", None),
+                        # Сохраним рекомендованные mute_hours от n8n для анализа, но не применяем напрямую
+                        "suggested_mute_hours": mute_hours,
+                    },
+                )
+            )
             try:
-                hours = float(mute_hours) if mute_hours is not None else float(getattr(getattr(settings, "moderation", object()), "abuse_mute_hours", 12))
+                logger.info(
+                    "abuse_flag_recorded",
+                    suggested_mute_hours=mute_hours,
+                    severity=getattr(meta_obj, "severity", None),
+                    text_preview=trimmed[:120],
+                )
             except Exception:
-                hours = float(getattr(getattr(settings, "moderation", object()), "abuse_mute_hours", 12))
-            state.sleep_until = utcnow() + timedelta(hours=hours)
-            # Event: abuse detected
-            session.add(Event(kind="abuse_detected", chat_id=chat_id, user_id=user_id, payload_json={"severity": getattr(meta_obj, "severity", None), "mute_hours": hours}))
-            # Rate limit: count abuse events in last 30 minutes
+                pass
+            # Подсчёт злоупотреблений в окне и авто-блокировка при превышении порога
             try:
                 from sqlalchemy import select, func
                 window_minutes = int(os.getenv("ABUSE_WINDOW_MINUTES", "30"))
@@ -682,7 +697,27 @@ async def process_user_text(
                 abuse_cnt = (await session.execute(abuse_cnt_q)).scalar() or 0
                 if abuse_cnt >= max_in_window:
                     state.sleep_until = utcnow() + timedelta(hours=autoblock_hours)
-                    session.add(Event(kind="abuse_auto_block", chat_id=chat_id, user_id=user_id, payload_json={"count": abuse_cnt, "window_min": window_minutes, "block_hours": autoblock_hours}))
+                    session.add(
+                        Event(
+                            kind="abuse_auto_block",
+                            chat_id=chat_id,
+                            user_id=user_id,
+                            payload_json={
+                                "count": abuse_cnt,
+                                "window_min": window_minutes,
+                                "block_hours": autoblock_hours,
+                            },
+                        )
+                    )
+                    try:
+                        logger.warning(
+                            "abuse_auto_block_set",
+                            count=abuse_cnt,
+                            window_min=window_minutes,
+                            block_hours=autoblock_hours,
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
     except Exception:

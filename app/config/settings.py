@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     reply_delay: ReplyDelaySettings = ReplyDelaySettings()
     antispam: AntiSpamSettings = AntiSpamSettings()
     moderation: ModerationSettings = ModerationSettings()
+    # Admins (comma-separated user ids in env ADMIN_USER_IDS)
+    admin_user_ids: list[int] = []
 
     # Proactive extended windows (HH:MM-HH:MM). Quiet hours, morning, evening
     proactive_morning_window: str | None = None  # e.g. "07:00-09:30"
@@ -162,6 +164,23 @@ class Settings(BaseSettings):
                 "DEFAULT_TIMEZONE_OFFSET_MINUTES",
                 _get_int_env("DEFAULT_TZ_OFFSET_MINUTES", self.default_timezone_offset_minutes),
             )
+        except Exception:
+            pass
+
+        # Admin IDs parsing
+        try:
+            raw_admins = os.getenv("ADMIN_USER_IDS")
+            if raw_admins:
+                ids: list[int] = []
+                for part in raw_admins.replace(";", ",").split(","):
+                    p = part.strip()
+                    if not p:
+                        continue
+                    try:
+                        ids.append(int(p))
+                    except ValueError:
+                        continue
+                self.admin_user_ids = ids
         except Exception:
             pass
 

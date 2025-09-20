@@ -10,7 +10,7 @@ from sqlalchemy import select, delete
 
 from app.config.settings import get_settings
 from app.db.base import session_scope
-from app.db.models import Chat, ChatState, User, Message as DBMessage, AssistantMessage as DBAssistantMessage
+from app.db.models import Chat, ChatState, User, Message as DBMessage, AssistantMessage as DBAssistantMessage, Event
 from app.utils.time import future_with_jitter, utcnow
 
 
@@ -202,3 +202,27 @@ async def cmd_wake(message: Message) -> None:
             session.add(state)
         state.sleep_until = None
     await message.answer("Я проснулась, можем продолжать ☀️")
+
+
+@commands_router.message(Command("wake_all"))
+async def cmd_wake_all(message: Message) -> None:
+    """Админская команда: снять сон у всех чатов."""
+    settings = get_settings()
+    user = message.from_user
+    if user is None or (settings.admin_user_ids and user.id not in settings.admin_user_ids):
+        await message.answer("Недостаточно прав")
+        return
+    now = utcnow()
+    affected = 0
+    async with session_scope() as session:
+        # Найдём все чаты где sleep_until > now
+        from sqlalchemy import select
+        q = select(ChatState).where(ChatState.sleep_until.is_not(None))
+        rows = (await session.execute(q)).scalars().all()
+        for st in rows:
+            if st.sleep_until and st.sleep_until > now:
+                st.sleep_until = None
+                affected += 1
+        # Логируем событие (опционально)
+        session.add(Event(kind="wake_all", chat_id=None, user_id=user.id, payload_json={"cleared": affected}))
+    await message.answer(f"Пробуждено чатов: {affected}")
