@@ -71,6 +71,9 @@ MORNING_SPAM_MAX = 1  # допустимо столько morning внутри �
 
 async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings) -> None:
     now_utc = utcnow()
+    # Глобальное отключение проактивов
+    if not getattr(settings.proactive, "enabled", True):
+        return
     # Stateless: просто берём все auto_enabled + persona выбран
     q = select(ChatState).where(ChatState.auto_enabled.is_(True))
     result = await session.execute(q)
@@ -80,6 +83,7 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
     win_evening = _parse_window(settings.proactive_evening_window)
     win_quiet = _parse_window(settings.proactive_quiet_window)
 
+    MESSAGE_GATE_THRESHOLD = getattr(settings.proactive, "msg_gate_threshold", 15)
     for state in states:
         persona = getattr(state, "persona_key", None)
         if not persona:
@@ -87,6 +91,14 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
         # Спит?
         if getattr(state, "sleep_until", None) and state.sleep_until > now_utc:
             continue
+        # Гейтинг по количеству пользовательских сообщений после последней проактивки
+        try:
+            if state.last_proactive_sent_at is not None:
+                cnt = getattr(state, "proactive_user_msg_count_since_last", None) or 0
+                if cnt < MESSAGE_GATE_THRESHOLD:
+                    continue  # ещё рано слать следующий проактив
+        except Exception:
+            pass
         # вычисляем локальное время (пока через offset, иначе UTC)
         if state.timezone_offset_minutes is None:
             offset_min = getattr(settings, "default_timezone_offset_minutes", 0)
@@ -216,6 +228,13 @@ async def process_due_chats(session: AsyncSession, bot: Bot, settings: Settings)
                 continue
 
         # Ставим отметку СРАЗУ (раньше отправки), чтобы при падении после send не зациклиться
+        # Универсальная отметка времени последней проактивной перед отправкой
+        state.last_proactive_sent_at = now_utc
+        # Сброс счётчика сообщений после новой проактивной отправки
+        try:
+            state.proactive_user_msg_count_since_last = 0
+        except Exception:
+            pass
         if intent == "proactive_morning":
             state.last_morning_sent_at = now_utc
         elif intent == "proactive_evening":

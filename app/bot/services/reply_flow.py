@@ -398,6 +398,13 @@ async def process_user_text(
         session.add(state)
     prev_user_ts = state.last_user_msg_at
     state.last_user_msg_at = now
+    # Инкремент счётчика сообщений после последней проактивной (используем для гейтинга будущих проактивов)
+    try:
+        if not lowered.startswith("/"):  # не считаем команды
+            current = getattr(state, "proactive_user_msg_count_since_last", None) or 0
+            state.proactive_user_msg_count_since_last = current + 1
+    except Exception:
+        pass
 
     # Универсальная поддержка команд через userbot (строгое сравнение во избежание коллизий)
     lowered = trimmed.lower()

@@ -38,6 +38,10 @@ class ProactiveSettings(BaseModel):
     max_seconds: int = 7200
     # Enable/disable generic fallback intent via env PROACTIVE_GENERIC_ENABLED
     generic_enabled: bool = True
+    # Количество пользовательских сообщений между проактивами
+    msg_gate_threshold: int = 15
+    # Глобальный мастер-флаг включения проактивов
+    enabled: bool = True
 
 
 class ReplyDelaySettings(BaseModel):
@@ -124,6 +128,10 @@ class Settings(BaseSettings):
         self.proactive.max_seconds = _get_int_env("PROACTIVE_MAX_SECONDS", self.proactive.max_seconds)
         # Optional: disable generic proactive via env
         self.proactive.generic_enabled = _get_bool_env("PROACTIVE_GENERIC_ENABLED", self.proactive.generic_enabled)
+    # Порог сообщений между проактивами
+    self.proactive.msg_gate_threshold = _get_int_env("PROACTIVE_MSG_GATE", self.proactive.msg_gate_threshold)
+    # Мастер-флаг
+    self.proactive.enabled = _get_bool_env("PROACTIVE_ENABLED", self.proactive.enabled)
 
         self.reply_delay.min_seconds = _get_int_env("REPLY_DELAY_MIN_SECONDS", self.reply_delay.min_seconds)
         self.reply_delay.max_seconds = _get_int_env("REPLY_DELAY_MAX_SECONDS", self.reply_delay.max_seconds)

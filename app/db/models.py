@@ -91,6 +91,10 @@ class ChatState(Base):
     proactive_via_userbot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     # Когда в последний раз применяли увеличенную задержку после длинной паузы
     last_long_pause_reply_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Отметка последней проактивной отправки (любой intent) для авто-отключения
+    last_proactive_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Количество пользовательских сообщений после последней проактивной отправки
+    proactive_user_msg_count_since_last: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     # Legacy compatibility: aggression/moderation fields expected by older images
     aggression_level: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
