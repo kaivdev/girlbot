@@ -25,8 +25,10 @@ async def on_text(message: Message) -> None:
     text = message.text or ""
 
     async with session_scope() as session:
-        # Попытка авто-флаша просроченного буфера перед обработкой нового текста
-        await flush_pending_input(message.bot, session, chat_id=chat.id, settings=settings)
+        # Вместо немедленного flush всегда пробуем ТОЛЬКО просроченный flush.
+        # Это позволяет сценарию: фото -> короткие последующие тексты стать одним агрегатом.
+        from app.bot.services.reply_flow import flush_expired_pending_input
+        await flush_expired_pending_input(message.bot, session, chat_id=chat.id, settings=settings)
         await buffer_or_process(
             message.bot,
             session,
