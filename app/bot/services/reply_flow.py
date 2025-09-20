@@ -368,6 +368,7 @@ async def process_user_text(
     settings: Settings,
     trace_id: Optional[str] = None,
     tg_message_id: int | None = None,
+    skip_persist_user: bool = False,
 ) -> str:
     """Process incoming user text and send a reply. Returns reply text sent."""
 
@@ -385,8 +386,8 @@ async def process_user_text(
         settings=settings,
     )
 
-    # Save user message
-    session.add(Message(chat_id=chat_id, user_id=user_id, text=trimmed, tg_message_id=tg_message_id))
+    if not skip_persist_user:
+        session.add(Message(chat_id=chat_id, user_id=user_id, text=trimmed, tg_message_id=tg_message_id))
 
     # Update chat state last_user_msg_at
     state = await session.get(ChatState, chat_id)

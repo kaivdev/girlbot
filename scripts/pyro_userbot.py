@@ -254,6 +254,23 @@ async def main() -> None:
             reason=current_flush_reasons.get(chat_id, "unknown"),
             total_chars=len(combined_text),
         )
+        # Persist originals as separate Message rows BEFORE aggregated processing to keep fine-grained history
+        try:
+            from app.db.models import Message as DBMessage, ChatState as DBChatState, Chat as DBChat, User as DBUser
+            async with session_scope() as session:
+                for m in msgs:
+                    try:
+                        # Minimal ensure of user/chat presence (fast path)
+                        if await session.get(DBChat, m.chat.id) is None:
+                            session.add(DBChat(id=m.chat.id, type=_chat_type_str(m.chat.type)))
+                        if m.from_user and await session.get(DBUser, m.from_user.id) is None:
+                            session.add(DBUser(id=m.from_user.id, username=m.from_user.username, lang=getattr(m.from_user, 'language_code', None)))
+                        session.add(DBMessage(chat_id=m.chat.id, user_id=(m.from_user.id if m.from_user else None), text=m.text or "", tg_message_id=m.id))
+                    except Exception as e:
+                        get_logger().warning("user_batch_persist_error", chat_id=m.chat.id, tg_message_id=m.id, error=str(e))
+                get_logger().info("user_batch_persist", chat_id=chat_id, persisted=len(msgs))
+        except Exception as e:
+            get_logger().error("user_batch_persist_fatal", chat_id=chat_id, error=str(e))
         _start_generation(chat_id, base, combined_text)
 
     current_flush_reasons: Dict[int, str] = {}
