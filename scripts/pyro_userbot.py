@@ -259,24 +259,44 @@ async def main() -> None:
     current_flush_reasons: Dict[int, str] = {}
 
     async def schedule_buffer_send(chat_id: int):
-        # Новая логика: ждём бездействия batch_inactivity_sec или переполнения лимита
         get_logger().info("buffer_timer_start", chat_id=chat_id, inactivity=batch_inactivity_sec, max_messages=batch_max_messages)
-        while True:
-            await asyncio.sleep(0.3)
-            if chat_id not in message_buffers:
-                break
-            buf = message_buffers.get(chat_id, [])
-            if not buf:
-                continue
-            last_ts = last_message_ts.get(chat_id, 0)
-            if time.monotonic() - last_ts >= batch_inactivity_sec:
-                current_flush_reasons[chat_id] = "inactivity"
-                break
-            if len(buf) >= batch_max_messages:
-                current_flush_reasons[chat_id] = "max_messages"
-                break
-        await flush_buffer(chat_id)
-        buffer_tasks.pop(chat_id, None)
+        try:
+            while True:
+                await asyncio.sleep(0.3)
+                if chat_id not in message_buffers:
+                    get_logger().info("buffer_timer_break", chat_id=chat_id, reason="no_buffer_entry")
+                    break
+                buf = message_buffers.get(chat_id, [])
+                size = len(buf)
+                if not buf:
+                    continue
+                last_ts = last_message_ts.get(chat_id, 0)
+                idle = time.monotonic() - last_ts
+                # Периодический тик
+                if int(time.monotonic()*10) % 20 == 0:  # примерно каждые ~2с
+                    get_logger().debug(
+                        "buffer_timer_tick",
+                        chat_id=chat_id,
+                        size=size,
+                        idle_round=round(idle,2),
+                        threshold=batch_inactivity_sec,
+                    )
+                if idle >= batch_inactivity_sec:
+                    current_flush_reasons[chat_id] = "inactivity"
+                    get_logger().info("buffer_timer_break", chat_id=chat_id, reason="inactivity", size=size, idle=round(idle,2))
+                    break
+                if size >= batch_max_messages:
+                    current_flush_reasons[chat_id] = "max_messages"
+                    get_logger().info("buffer_timer_break", chat_id=chat_id, reason="max_messages", size=size)
+                    break
+        except Exception as e:
+            get_logger().error("buffer_timer_error", chat_id=chat_id, error=str(e))
+        finally:
+            try:
+                await flush_buffer(chat_id)
+            except Exception as e:
+                get_logger().error("buffer_flush_error", chat_id=chat_id, error=str(e))
+            buffer_tasks.pop(chat_id, None)
 
     async def _process_single(app: Client, shim: PyroBotShim, message: Message, text: str, media: Optional[Dict] = None, *, disable_local_typing: bool = False, use_buffer: bool = False):
         trace_id = str(uuid.uuid4())
@@ -652,6 +672,15 @@ async def main() -> None:
                         reason="debounce",
                         since_last_ms=(now - last_fire)*1000,
                     )
+        # Health check: если таймер завершился (done) но буфер не пустой — перезапускаем
+        existing_task = buffer_tasks.get(message.chat.id)
+        if existing_task and existing_task.done():
+            get_logger().warning(
+                "buffer_timer_zombie_detected",
+                chat_id=message.chat.id,
+                had_exception=bool(existing_task.exception()) if hasattr(existing_task, 'exception') else None,
+            )
+            buffer_tasks.pop(message.chat.id, None)
         buf = message_buffers.setdefault(message.chat.id, [])
         buf.append(message)
         get_logger().info(

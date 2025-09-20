@@ -3,6 +3,7 @@ from __future__ import annotations
 """Structured logging setup using structlog and orjson."""
 
 import logging
+import os
 import sys
 from typing import Any
 
@@ -24,10 +25,17 @@ def _orjson_dumps(obj: Any, default: Any | None = None, **_: Any) -> str:
 
 
 def configure_logging(level: str = "INFO") -> None:
-    """Configure structlog with JSON rendering and stdlib bridge."""
+    """Configure structlog with JSON rendering and stdlib bridge.
+
+    LOG_LEVEL env var overrides provided level.
+    """
+    env_level = os.getenv("LOG_LEVEL")
+    if env_level:
+        level = env_level
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
 
     handlers = [logging.StreamHandler(sys.stdout)]
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), handlers=handlers)
+    logging.basicConfig(level=numeric_level, handlers=handlers)
 
     structlog.configure(
         processors=[
@@ -39,7 +47,7 @@ def configure_logging(level: str = "INFO") -> None:
             structlog.processors.UnicodeDecoder(),
             structlog.processors.JSONRenderer(serializer=_orjson_dumps),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level.upper(), logging.INFO)),
+        wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
