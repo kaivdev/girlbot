@@ -203,9 +203,12 @@ async def main() -> None:
 
     # Batch configuration
     batch_enabled = os.getenv("USERBOT_BATCH_ENABLED", "0").lower() in {"1","true","yes","on"}
-    batch_max_wait = float(os.getenv("USERBOT_BATCH_MAX_WAIT", "3.0"))   # сек макс ожидание перед ответом
-    batch_quiet_grace = float(os.getenv("USERBOT_BATCH_QUIET_GRACE", "1.0"))  # сколько тишины нужно перед отправкой
-    batch_max_messages = int(os.getenv("USERBOT_BATCH_MAX_MESSAGES", "5"))    # максимум объединяемых сообщений
+    # Новая логика: вместо склейки -> задержанный запуск обработки после окна тишины или достижения лимита сообщений
+    batch_inactivity_sec = float(os.getenv("USERBOT_BATCH_INACTIVITY", "10.0"))  # окно бездействия
+    batch_max_messages = int(os.getenv("USERBOT_BATCH_MAX_MESSAGES", "50"))    # максимум сообщений в пакете
+    batch_debounce_cancel_ms = int(os.getenv("USERBOT_BATCH_DEBOUNCE_CANCEL_MS", "900"))
+    batch_cancel_cooldown_sec = float(os.getenv("USERBOT_BATCH_CANCEL_COOLDOWN", "15"))
+    batch_cancel_window_sec = float(os.getenv("USERBOT_BATCH_CANCEL_WINDOW", "10"))
     outbox_poll_seconds = float(os.getenv("USERBOT_OUTBOX_POLL_SECONDS", "10"))
     cancel_on_new_msg = os.getenv("USERBOT_CANCEL_ON_NEW_MSG", "1").lower() in {"1","true","yes","on"}
     # Wait time to attach follow-up text to a photo that's still uploading
@@ -215,10 +218,19 @@ async def main() -> None:
     message_buffers: Dict[int, List[Message]] = {}
     buffer_tasks: Dict[int, asyncio.Task] = {}
     inflight_tasks: Dict[int, asyncio.Task] = {}
+    last_message_ts: Dict[int, float] = {}
+    cancel_events: Dict[int, List[float]] = {}
+    debounce_timers: Dict[int, float] = {}
     # Chats where a photo is being processed (uploading/creating DB pending)
     photo_inflight: Dict[int, float] = {}
 
     def _start_generation(chat_id: int, base: Message, combined_text: str):
+        get_logger().info(
+            "buffer_generation_start",
+            chat_id=chat_id,
+            messages=len(message_buffers.get(chat_id, [])),
+            sample=combined_text[:120],
+        )
         task = asyncio.create_task(_process_single(app, shim, base, combined_text))
         inflight_tasks[chat_id] = task
         def _cleanup(_):
@@ -235,28 +247,34 @@ async def main() -> None:
         base = msgs[-1]
         combined_text = " \n".join(m.text or "" for m in msgs)
         message_buffers[chat_id] = []
+        get_logger().info(
+            "buffer_flush",
+            chat_id=chat_id,
+            count=len(msgs),
+            reason=current_flush_reasons.get(chat_id, "unknown"),
+            total_chars=len(combined_text),
+        )
         _start_generation(chat_id, base, combined_text)
 
+    current_flush_reasons: Dict[int, str] = {}
+
     async def schedule_buffer_send(chat_id: int):
-        # ждём пока либо тишина >= batch_quiet_grace с момента последнего изменения,
-        # либо истечёт batch_max_wait с момента первого сообщения в буфере
-        start = time.monotonic()
-        last_len = len(message_buffers.get(chat_id, []))
-        last_change_ts = start
+        # Новая логика: ждём бездействия batch_inactivity_sec или переполнения лимита
+        get_logger().info("buffer_timer_start", chat_id=chat_id, inactivity=batch_inactivity_sec, max_messages=batch_max_messages)
         while True:
-            await asyncio.sleep(0.2)
-            now = time.monotonic()
-            # тишина достаточная?
-            if len(message_buffers.get(chat_id, [])) > 0 and (now - last_change_ts) >= batch_quiet_grace:
+            await asyncio.sleep(0.3)
+            if chat_id not in message_buffers:
                 break
-            # превысили общий максимум ожидания
-            if now - start >= batch_max_wait:
+            buf = message_buffers.get(chat_id, [])
+            if not buf:
+                continue
+            last_ts = last_message_ts.get(chat_id, 0)
+            if time.monotonic() - last_ts >= batch_inactivity_sec:
+                current_flush_reasons[chat_id] = "inactivity"
                 break
-            # отслеживаем изменения размера буфера
-            current = len(message_buffers.get(chat_id, []))
-            if current != last_len:
-                last_len = current
-                last_change_ts = now
+            if len(buf) >= batch_max_messages:
+                current_flush_reasons[chat_id] = "max_messages"
+                break
         await flush_buffer(chat_id)
         buffer_tasks.pop(chat_id, None)
 
@@ -574,20 +592,78 @@ async def main() -> None:
         if cancel_on_new_msg:
             task = inflight_tasks.get(message.chat.id)
             if task and not task.done():
-                task.cancel()
-                with contextlib.suppress(Exception):
-                    await task
+                now = time.monotonic()
+                # Дебаунс отмены
+                last_fire = debounce_timers.get(message.chat.id, 0)
+                if (now - last_fire)*1000 >= batch_debounce_cancel_ms:
+                    # Проверяем окно частых отмен
+                    ev_list = cancel_events.setdefault(message.chat.id, [])
+                    ev_list.append(now)
+                    # чистим просроченные
+                    cancel_events[message.chat.id] = [t for t in ev_list if now - t <= batch_cancel_window_sec]
+                    if len(cancel_events[message.chat.id]) >= 2:
+                        # Вошли в бурст отмен — возможно пропускаем отмену в cooldown период
+                        last_two = cancel_events[message.chat.id][-2]
+                        if now - last_two < batch_cancel_window_sec:
+                            # Если уже в cooldown — не отменяем
+                            if now - last_two < batch_cancel_window_sec and (now - last_fire) < batch_cancel_cooldown_sec:
+                                get_logger().info(
+                                    "buffer_cancel_skipped",
+                                    chat_id=message.chat.id,
+                                    reason="cooldown",
+                                    recent_cancels=len(cancel_events[message.chat.id]),
+                                )
+                            else:
+                                task.cancel()
+                                debounce_timers[message.chat.id] = now
+                                get_logger().info(
+                                    "buffer_cancel_attempt",
+                                    chat_id=message.chat.id,
+                                    reason="burst_cancel",
+                                    recent_cancels=len(cancel_events[message.chat.id]),
+                                )
+                        else:
+                            task.cancel()
+                            debounce_timers[message.chat.id] = now
+                            get_logger().info(
+                                "buffer_cancel_attempt",
+                                chat_id=message.chat.id,
+                                reason="second_in_window",
+                                recent_cancels=len(cancel_events[message.chat.id]),
+                            )
+                    else:
+                        task.cancel()
+                        debounce_timers[message.chat.id] = now
+                        get_logger().info(
+                            "buffer_cancel_attempt",
+                            chat_id=message.chat.id,
+                            reason="first_cancel",
+                            recent_cancels=len(cancel_events[message.chat.id]),
+                        )
 
+                    get_logger().info(
+                        "buffer_cancel_skipped",
+                        chat_id=message.chat.id,
+                        reason="debounce",
+                        since_last_ms=(now - last_fire)*1000,
+                    )
         buf = message_buffers.setdefault(message.chat.id, [])
         buf.append(message)
-        # Если превысили лимит — сразу flush
+        get_logger().info(
+            "buffer_append",
+            chat_id=message.chat.id,
+            size=len(buf),
+            max=batch_max_messages,
+            text_preview=(message.text or "")[:80],
+        )
+        last_message_ts[message.chat.id] = time.monotonic()
+        # Лимит — немедленный flush
         if len(buf) >= batch_max_messages:
             if task := buffer_tasks.get(message.chat.id):
                 task.cancel()
                 with contextlib.suppress(Exception):
                     await task
             if use_queue:
-                # Собираем и ставим в очередь как одно сообщение
                 msgs = message_buffers.get(message.chat.id, [])
                 if msgs:
                     base = msgs[-1]
@@ -597,9 +673,9 @@ async def main() -> None:
             else:
                 await flush_buffer(message.chat.id)
             return
-        # Если нет активного таска — запускаем
         if message.chat.id not in buffer_tasks:
             buffer_tasks[message.chat.id] = asyncio.create_task(schedule_buffer_send(message.chat.id))
+            get_logger().info("buffer_timer_created", chat_id=message.chat.id)
 
     @app.on_message((filters.voice | filters.audio) & ~filters.me)
     async def handle_voice(_: Client, message: Message):
@@ -912,26 +988,57 @@ async def main() -> None:
                     count += 1
                     if count >= recovery_limit:
                         break
-                if not missing:
-                    continue
-                metrics.inc("recovery_gap_messages_total", value=len(missing), labels={"kind": "incoming_user_message"})
-                # Добавляем в очередь в порядке возрастания id (старые сначала)
-                for m in sorted(missing, key=lambda x: x.id):
-                    text_val = m.text or m.caption or ""
-                    payload = {
-                        "telegram_message_id": m.id,
-                        "chat_id": cid,
-                        "chat_type": _chat_type_str(m.chat.type if getattr(m, 'chat', None) else None),
-                        "user_id": getattr(m.from_user, 'id', None) if m.from_user else None,
-                        "username": getattr(m.from_user, 'username', None) if m.from_user else None,
-                        "lang": getattr(m.from_user, 'language_code', None) if m.from_user else None,
-                        "text": text_val,
-                        "media": None,
-                    }
+                if missing:
+                    metrics.inc("recovery_gap_messages_total", value=len(missing), labels={"kind": "incoming_user_message"})
+                    for m in sorted(missing, key=lambda x: x.id):
+                        text_val = m.text or m.caption or ""
+                        payload = {
+                            "telegram_message_id": m.id,
+                            "chat_id": cid,
+                            "chat_type": _chat_type_str(m.chat.type if getattr(m, 'chat', None) else None),
+                            "user_id": getattr(m.from_user, 'id', None) if m.from_user else None,
+                            "username": getattr(m.from_user, 'username', None) if m.from_user else None,
+                            "lang": getattr(m.from_user, 'language_code', None) if m.from_user else None,
+                            "text": text_val,
+                            "media": None,
+                        }
+                        async with session_scope() as session:
+                            dedup = f"recovery:{cid}:{m.id}"
+                            await enqueue_task(session, kind="incoming_user_message", payload=payload, priority=90, dedup_key=dedup)
+                            metrics.inc("tasks_created_total", labels={"kind": "incoming_user_message", "source": "recovery"})
+                # Assistant backfill (берём последние сообщения userbot'а если их нет в БД)
+                try:
                     async with session_scope() as session:
-                        dedup = f"recovery:{cid}:{m.id}"
-                        await enqueue_task(session, kind="incoming_user_message", payload=payload, priority=90, dedup_key=dedup)
-                        metrics.inc("tasks_created_total", labels={"kind": "incoming_user_message", "source": "recovery"})
+                        from sqlalchemy import select as _select2
+                        from app.db.models import AssistantMessage as _A
+                        existing_a_ids = set(
+                            r[0]
+                            for r in (
+                                await session.execute(
+                                    _select2(_A.tg_message_id).where(_A.chat_id == cid, _A.tg_message_id.is_not(None))
+                                )
+                            ).all()
+                        )
+                    a_missing: list[Message] = []
+                    count_a = 0
+                    async for h in app.get_chat_history(cid, limit=recovery_limit):
+                        if not (h.text or h.caption):
+                            continue
+                        if not (h.from_user and h.from_user.id == my_id):
+                            continue
+                        if h.id in existing_a_ids:
+                            continue
+                        a_missing.append(h)
+                        count_a += 1
+                        if count_a >= recovery_limit:
+                            break
+                    if a_missing:
+                        metrics.inc("recovery_gap_messages_total", value=len(a_missing), labels={"kind": "assistant_backfill"})
+                        async with session_scope() as session:
+                            for am in sorted(a_missing, key=lambda x: x.id):
+                                session.add(AssistantMessage(chat_id=cid, text=am.text or am.caption or "", meta_json={"recovered": True}))
+                except Exception:
+                    pass
             except Exception:
                 continue
 

@@ -503,6 +503,18 @@ async def process_user_text(
         except Exception:
             reply = "Спокойной ночи!"  # fallback
         await bot.send_message(chat_id, reply)
+        # Persist proactive assistant reply
+        session.add(
+            AssistantMessage(
+                chat_id=chat_id,
+                text=reply,
+                meta_json={
+                    "intent": "user_goodnight",
+                    "proactive": True,
+                    "persona": getattr(state, "persona_key", None),
+                },
+            )
+        )
         state.sleep_until = wake_utc
         state.last_assistant_at = utcnow()
         return reply
@@ -533,6 +545,17 @@ async def process_user_text(
                 except Exception:
                     reply = "Я ухожу спать до утра."  # fallback
                 await bot.send_message(chat_id, reply)
+                session.add(
+                    AssistantMessage(
+                        chat_id=chat_id,
+                        text=reply,
+                        meta_json={
+                            "intent": "goodnight_followup",
+                            "proactive": True,
+                            "persona": getattr(state, "persona_key", None),
+                        },
+                    )
+                )
                 state.sleep_until = wake_utc
                 state.last_goodnight_followup_sent_at = utcnow()
                 state.last_assistant_at = utcnow()
@@ -540,7 +563,13 @@ async def process_user_text(
 
     # Build n8n request
     history = await fetch_recent_history(
-        session, chat_id, limit_pairs=10, persona=getattr(state, "persona_key", None)
+        session,
+        chat_id,
+        limit_pairs=50,  # expanded window target (user requirement)
+        persona=getattr(state, "persona_key", None),
+        soft_char_limit=8000,
+        soft_head=4000,
+        soft_tail=2000,
     )
     ctx = Context(
         history=history,
