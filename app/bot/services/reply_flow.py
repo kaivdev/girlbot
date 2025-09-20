@@ -300,17 +300,10 @@ def _has_goodnight(text: str) -> bool:
     return any(k in t for k in GOODNIGHT_KEYWORDS)
 
 
-ABUSE_PATTERNS = [
-    r"\b(сука|шлюх|туп(ая|ой)|идиот|дебил|мразь|тварь|урод|еблан|нахуй|выеб|пошел\s*нах)\b",
-    r"\b(fuck|bitch|whore|slut|stupid|idiot|moron|retard)\b",
-]
+ABUSE_PATTERNS: list[str] = []  # regex detection disabled (using n8n classifier)
 
 
-def is_abusive(text: str) -> bool:
-    t = _normalize(text)
-    for pat in ABUSE_PATTERNS:
-        if re.search(pat, t, flags=re.IGNORECASE):
-            return True
+def is_abusive(text: str) -> bool:  # kept for compatibility, always False now
     return False
 
 
@@ -431,26 +424,7 @@ async def process_user_text(
         # Не отвечаем, тихий игнор
         return "(sleep)"
 
-    # Moderation: если пользователь оскорбляет — включаем «грубый» ответ и/или мьют
-    try:
-        if getattr(settings, "moderation", None) and settings.moderation.abuse_enabled and is_abusive(trimmed):
-            # Включаем короткий резкий ответ и мьют до now + abuse_mute_hours
-            mute_until = now + timedelta(hours=settings.moderation.abuse_mute_hours)
-            state.sleep_until = mute_until
-            history = []
-            ctx = Context(history=history, last_user_msg_at=state.last_user_msg_at, last_assistant_at=state.last_assistant_at)
-            chat_info = ChatInfo(chat_id=chat_id, user_id=user_id, lang=lang, username=username, persona=getattr(state, "persona_key", None), memory_rev=getattr(state, "memory_rev", None))
-            req = N8nRequest(intent="reply", chat=chat_info, context=ctx, message=MessageIn(text="[abuse_detected] " + trimmed), trace_id=trace_id)
-            try:
-                n8n_resp = await call_n8n(req, trace_id=trace_id)
-                reply_text = n8n_resp.reply
-            except Exception:
-                reply_text = "Не перегибай. Вернусь позже."
-            await bot.send_message(chat_id, reply_text)
-            state.last_assistant_at = utcnow()
-            return reply_text
-    except Exception:
-        pass
+    # Moderation: локальный regex отключён, всё решает n8n meta.abuse
 
     # Определение quiet окна
     def _parse_window(win: str | None):
@@ -628,7 +602,7 @@ async def process_user_text(
         metrics.inc("n8n_errors_total", labels={"intent": "reply", "class": "other"})
         raise
 
-    # Если n8n пометил сообщение как оскорбительное — сразу уходим в «сон» на указанный срок
+    # Если n8n пометил сообщение как оскорбительное — фиксируем событие и применяем мьют
     try:
         meta_obj = getattr(n8n_resp, "meta", None)
         abuse_flag = None
@@ -649,6 +623,26 @@ async def process_user_text(
             except Exception:
                 hours = float(getattr(getattr(settings, "moderation", object()), "abuse_mute_hours", 12))
             state.sleep_until = utcnow() + timedelta(hours=hours)
+            # Event: abuse detected
+            session.add(Event(kind="abuse_detected", chat_id=chat_id, user_id=user_id, payload_json={"severity": getattr(meta_obj, "severity", None), "mute_hours": hours}))
+            # Rate limit: count abuse events in last 30 minutes
+            try:
+                from sqlalchemy import select, func
+                window_minutes = int(os.getenv("ABUSE_WINDOW_MINUTES", "30"))
+                max_in_window = int(os.getenv("ABUSE_MAX_IN_WINDOW", "10"))
+                autoblock_hours = int(os.getenv("ABUSE_AUTO_BLOCK_HOURS", "24"))
+                cutoff = utcnow() - timedelta(minutes=window_minutes)
+                abuse_cnt_q = select(func.count(Event.id)).where(
+                    Event.chat_id == chat_id,
+                    Event.kind == "abuse_detected",
+                    Event.created_at > cutoff,
+                )
+                abuse_cnt = (await session.execute(abuse_cnt_q)).scalar() or 0
+                if abuse_cnt >= max_in_window:
+                    state.sleep_until = utcnow() + timedelta(hours=autoblock_hours)
+                    session.add(Event(kind="abuse_auto_block", chat_id=chat_id, user_id=user_id, payload_json={"count": abuse_cnt, "window_min": window_minutes, "block_hours": autoblock_hours}))
+            except Exception:
+                pass
     except Exception:
         pass
 
