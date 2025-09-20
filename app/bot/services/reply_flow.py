@@ -399,16 +399,40 @@ async def process_user_text(
     prev_user_ts = state.last_user_msg_at
     state.last_user_msg_at = now
 
-    # Универсальная поддержка /wake и /reset (в т.ч. через userbot), даже если sleep активен.
+    # Универсальная поддержка команд через userbot (строгое сравнение во избежание коллизий)
     lowered = trimmed.lower()
-    if lowered.startswith("/wake"):
+    if lowered == "/wake":
         if getattr(state, "sleep_until", None):
             state.sleep_until = None
         reply = "Я проснулась, можем продолжать ☀️"
         await bot.send_message(chat_id, reply)
         state.last_assistant_at = utcnow()
         return reply
-    elif lowered.startswith("/reset"):
+    elif lowered == "/wake_all":
+        # Админская глобальная команда (через userbot поток). Проверяем admin_user_ids из settings.
+        admin_ids = getattr(settings, "admin_user_ids", []) or []
+        if admin_ids and (user_id is None or user_id not in admin_ids):
+            # Тихо игнорируем чтобы не раскрывать наличие команды
+            return "(ignored)"
+        # Разбудим все чаты
+        from sqlalchemy import select
+        q = select(ChatState).where(ChatState.sleep_until.is_not(None))
+        rows = (await session.execute(q)).scalars().all()
+        now_local2 = utcnow()
+        count = 0
+        for st in rows:
+            if st.sleep_until and st.sleep_until > now_local2:
+                st.sleep_until = None
+                count += 1
+        session.add(Event(kind="wake_all", chat_id=None, user_id=user_id, payload_json={"cleared": count}))
+        reply = f"Пробуждено чатов: {count}"
+        try:
+            await bot.send_message(chat_id, reply)
+        except Exception:
+            pass
+        state.last_assistant_at = utcnow()
+        return reply
+    elif lowered == "/reset":
         # Сброс состояния как в команде reset
         if getattr(state, "sleep_until", None):
             state.sleep_until = None
@@ -416,7 +440,7 @@ async def process_user_text(
         await bot.send_message(chat_id, reply)
         state.last_assistant_at = utcnow()
         return reply
-    elif lowered.startswith("/status"):
+    elif lowered == "/status":
         # Состояние чата (зеркало команды из commands_router, но нужно и для userbot очереди)
         now_local = utcnow()
         sleeping = bool(state.sleep_until and state.sleep_until > now_local)
