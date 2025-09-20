@@ -416,6 +416,40 @@ async def process_user_text(
         await bot.send_message(chat_id, reply)
         state.last_assistant_at = utcnow()
         return reply
+    elif lowered.startswith("/status"):
+        # Состояние чата (зеркало команды из commands_router, но нужно и для userbot очереди)
+        now_local = utcnow()
+        sleeping = bool(state.sleep_until and state.sleep_until > now_local)
+        remaining = None
+        if sleeping:
+            remaining = int((state.sleep_until - now_local).total_seconds())  # type: ignore[arg-type]
+        reason = None
+        if sleeping:
+            try:
+                from sqlalchemy import select
+                abuse_q = select(Event).where(Event.chat_id==chat_id, Event.kind.in_(["abuse_auto_block","abuse_detected"]))\
+                    .order_by(Event.id.desc()).limit(1)
+                ev = (await session.execute(abuse_q)).scalars().first()
+                if ev:
+                    reason = "abuse_auto_block" if ev.kind=="abuse_auto_block" else "abuse_detected"
+            except Exception:
+                pass
+        if sleeping and reason is None:
+            reason = "night_mode_or_manual"
+        persona = getattr(state, "persona_key", None) or "nika"
+        auto = "on" if state.auto_enabled else "off"
+        parts = [f"persona: {persona}", f"proactive: {auto}"]
+        if sleeping:
+            parts.append(f"sleep: yes ({remaining}s left, reason={reason})")
+        else:
+            parts.append("sleep: no")
+        reply = "; ".join(parts)
+        try:
+            await bot.send_message(chat_id, reply)
+        except Exception:
+            pass
+        state.last_assistant_at = utcnow()
+        return reply
 
     metrics.inc("messages_received_total")
 
