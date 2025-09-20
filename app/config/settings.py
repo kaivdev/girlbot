@@ -93,8 +93,8 @@ class Settings(BaseSettings):
     reply_delay: ReplyDelaySettings = ReplyDelaySettings()
     antispam: AntiSpamSettings = AntiSpamSettings()
     moderation: ModerationSettings = ModerationSettings()
-    # Admins (comma-separated user ids in env ADMIN_USER_IDS)
-    admin_user_ids: list[int] = []
+    # Admins (comma/semicolon-separated user ids). Accepts str/int/list in env.
+    admin_user_ids: list[int] | str | int | None = None
 
     # Proactive extended windows (HH:MM-HH:MM). Quiet hours, morning, evening
     proactive_morning_window: str | None = None  # e.g. "07:00-09:30"
@@ -167,22 +167,45 @@ class Settings(BaseSettings):
         except Exception:
             pass
 
-        # Admin IDs parsing
+        # Admin IDs normalization (supports env ADMIN_USER_IDS as single id, csv or json list)
         try:
-            raw_admins = os.getenv("ADMIN_USER_IDS")
-            if raw_admins:
-                ids: list[int] = []
-                for part in raw_admins.replace(";", ",").split(","):
-                    p = part.strip()
-                    if not p:
-                        continue
+            raw = self.admin_user_ids
+            ids: list[int] = []
+            if isinstance(raw, list):
+                for v in raw:
                     try:
-                        ids.append(int(p))
-                    except ValueError:
+                        ids.append(int(v))
+                    except Exception:
                         continue
-                self.admin_user_ids = ids
+            elif isinstance(raw, int):
+                ids = [raw]
+            elif isinstance(raw, str):
+                txt = raw.strip()
+                # If looks like JSON list, try eval via simple parsing
+                if txt.startswith("[") and txt.endswith("]"):
+                    try:
+                        import json as _json
+                        arr = _json.loads(txt)
+                        if isinstance(arr, list):
+                            for v in arr:
+                                try:
+                                    ids.append(int(v))
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                else:
+                    for part in txt.replace(";", ",").split(","):
+                        p = part.strip()
+                        if not p:
+                            continue
+                        try:
+                            ids.append(int(p))
+                        except Exception:
+                            continue
+            self.admin_user_ids = ids  # type: ignore[assignment]
         except Exception:
-            pass
+            self.admin_user_ids = []  # type: ignore[assignment]
 
 
 @lru_cache(maxsize=1)
