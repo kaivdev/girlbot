@@ -61,6 +61,15 @@ async def fetch_recent_history(
 
     items = [HistoryItem(role=role, text=text, created_at=created_at) for role, text, created_at in combined]
 
+    # De-duplicate consecutive identical (role,text) pairs that can appear if
+    # an aggregated buffered message and its original fragments both persisted.
+    deduped: list[HistoryItem] = []
+    for it in items:
+        if deduped and deduped[-1].role == it.role and deduped[-1].text == it.text:
+            continue
+        deduped.append(it)
+    items = deduped
+
     if soft_char_limit and soft_char_limit > 0:
         total = sum(len(it.text) for it in items)
         if total > soft_char_limit and len(items) > 2:

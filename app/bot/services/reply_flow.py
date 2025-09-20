@@ -96,6 +96,12 @@ async def flush_pending_input(
     if not state or not getattr(state, 'pending_input_json', None):
         return None
     payload = state.pending_input_json or {}
+    # Guard against concurrent double flush (background timer + manual) by marking and early exit
+    if payload.get('_flushing'):
+        return None
+    payload['_flushing'] = True
+    state.pending_input_json = payload
+    await session.flush()
     text = (payload.get('text') or '').strip()
     media = payload.get('media') or None
     user_id = payload.get('user_id')
@@ -106,6 +112,8 @@ async def flush_pending_input(
     state.pending_input_json = None
     state.pending_started_at = None
     state.pending_updated_at = None
+    # Flush cleared buffer so parallel sessions do not see stale pending_input_json
+    await session.flush()
     # Сохранение и обработка как обычного текста
     return await process_user_text(
         bot,
