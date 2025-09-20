@@ -94,6 +94,44 @@ async def cmd_auto_off(message: Message) -> None:
     await message.answer("Проактивный режим выключен")
 
 
+@commands_router.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    """Показать текущее состояние чата (сон, проактив, персона, задержки)."""
+    chat_id = message.chat.id
+    async with session_scope() as session:
+        state = await session.get(ChatState, chat_id)
+        if state is None:
+            await message.answer("Статус: нет состояния (пока не было сообщений).")
+            return
+        now = utcnow()
+        sleeping = bool(state.sleep_until and state.sleep_until > now)
+        sleep_left = None
+        if sleeping:
+            sleep_left = int((state.sleep_until - now).total_seconds())  # type: ignore[arg-type]
+        # Пытаемся вывести причину сна по эвентам (последние 1-2)
+        reason = None
+        if sleeping:
+            from sqlalchemy import select
+            q = select(Event).where(Event.chat_id==chat_id, Event.kind.in_(["abuse_detected","abuse_auto_block"])).order_by(Event.id.desc()).limit(1)
+            ev = (await session.execute(q)).scalars().first()
+            if ev:
+                if ev.kind == "abuse_auto_block":
+                    reason = f"auto_block (count={ev.payload_json.get('count')})"
+                elif ev.kind == "abuse_detected":
+                    reason = f"abuse (mute_hours={ev.payload_json.get('mute_hours')})"
+        if sleeping and reason is None:
+            # вероятно ночной режим
+            reason = "night_mode"
+        persona = getattr(state, 'persona_key', None) or 'nika'
+        auto = 'on' if state.auto_enabled else 'off'
+        parts = [f"persona: {persona}", f"proactive: {auto}"]
+        if sleeping:
+            parts.append(f"sleep: yes ({sleep_left}s left, reason={reason})")
+        else:
+            parts.append("sleep: no")
+        await message.answer("; ".join(parts))
+
+
 @commands_router.callback_query(F.data.startswith("persona:"))
 async def on_persona_selected(query: CallbackQuery) -> None:
     chat_id = query.message.chat.id if query.message else None

@@ -939,7 +939,30 @@ async def main() -> None:
                         payload = t.payload_json
                         start_monotonic = time.monotonic()
                         logger = get_logger().bind(task_id=t.id, attempt=t.attempts, chat_id=payload.get("chat_id"), trace_id=payload.get("trace_id"))
-                        logger.info("task_start", kind=t.kind)
+                        # Дополнительная диагностика сна чата
+                        sleep_info = {}
+                        try:
+                            state = await session.get(ChatState, payload.get("chat_id"))
+                            if state and getattr(state, 'sleep_until', None):
+                                now_utc = utcnow()
+                                if state.sleep_until > now_utc:  # type: ignore[operator]
+                                    remaining = int((state.sleep_until - now_utc).total_seconds())  # type: ignore[arg-type]
+                                    # Попытка вывести причину: смотрим последние события абьюза
+                                    from sqlalchemy import select
+                                    ev_q = select(Event).where(Event.chat_id==payload.get("chat_id"), Event.kind.in_(["abuse_auto_block","abuse_detected"])).order_by(Event.id.desc()).limit(1)
+                                    ev = (await session.execute(ev_q)).scalars().first()
+                                    reason = None
+                                    if ev:
+                                        if ev.kind == "abuse_auto_block":
+                                            reason = "abuse_auto_block"
+                                        elif ev.kind == "abuse_detected":
+                                            reason = "abuse_detected"
+                                    if reason is None:
+                                        reason = "night_mode_or_manual"
+                                    sleep_info = {"sleeping": True, "remaining_sec": remaining, "reason": reason}
+                        except Exception:
+                            pass
+                        logger.info("task_start", kind=t.kind, **sleep_info)
                         try:
                             await process_user_text(
                                 shim,
